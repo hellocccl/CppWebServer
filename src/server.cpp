@@ -206,14 +206,36 @@ void Server::handle_client(Server* server, int client_fd) {
     server->handle_client_impl(client_fd);
 }
 
+void Server::check_timeout_connections() {
+    time_t now = std::time(nullptr);
+    const int TIMEOUT = 30; // 30秒超时
+
+    for (auto it = last_active_.begin(); it != last_active_.end(); ) {
+        int fd = it->first;
+        time_t last_time = it->second;
+
+        if (now - last_time > TIMEOUT) {
+            Logger::instance().info(
+                "连接超时，关闭 fd = " + std::to_string(fd)
+            );
+            epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
+            close(fd);
+            it = last_active_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 void Server::run() {
     const int MAX_EVENTS = 1024;
     epoll_event events[MAX_EVENTS];
 
     while (true) {
-        int nfds = epoll_wait(epfd_, events, MAX_EVENTS, -1);
+        int nfds = epoll_wait(epfd_, events, MAX_EVENTS, 10000);
         if (nfds == -1) {
             if (errno == EINTR) {
+                check_timeout_connections();
                 Logger::instance().debug("epoll_wait 被信号中断，继续等待");
                 continue;
             }
@@ -222,6 +244,8 @@ void Server::run() {
         }
 
         Logger::instance().debug("epoll_wait 返回，就绪 fd 数量 = " + std::to_string(nfds));
+         // 每轮都检查一下超时连接
+        check_timeout_connections();
 
         for (int i = 0; i < nfds; i++) {
             int fd = events[i].data.fd;
@@ -241,7 +265,7 @@ void Server::run() {
                             break;
                         }
                     }
-
+                    
                     char ip[INET_ADDRSTRLEN] = {0};
                     inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
                     int port = ntohs(client_addr.sin_port);
@@ -272,7 +296,10 @@ void Server::run() {
                         close(client_fd);
                         continue;
                     }
-
+                    {
+                        std::lock_guard<std::mutex> lock(conn_mtx_);
+                        last_active_[client_fd] = std::time(nullptr);
+                    }
                     Logger::instance().debug(
                         "客户端 fd 已加入 epoll, client_fd = " + std::to_string(client_fd)
                     );
@@ -285,16 +312,23 @@ void Server::run() {
                 Logger::instance().debug(
                     "客户端 fd 可读，准备交给线程池处理, client_fd = " + std::to_string(client_fd)
                 );
-
+                {
+                    std::lock_guard<std::mutex> lock(conn_mtx_);
+                    last_active_[client_fd] = std::time(nullptr);
+                }
                 if (epoll_ctl(epfd_, EPOLL_CTL_DEL, client_fd, nullptr) == -1) {
                     Logger::instance().error(
                         "epoll_ctl DEL client_fd 失败, fd = " + std::to_string(client_fd) +
                         ", error = " + std::string(strerror(errno))
                     );
                     close(client_fd);
+                    {
+                        std::lock_guard<std::mutex> lock(conn_mtx_);
+                        last_active_.erase(client_fd);
+                    }   
                     continue;
                 }
-
+                
                 pool_.enqueue([this, client_fd]() {
                     Server::handle_client(this, client_fd);
                 });
@@ -312,6 +346,10 @@ void Server::run() {
                 );
                 epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
                 close(fd);
+                {
+                    std::lock_guard<std::mutex> lock(conn_mtx_);
+                    last_active_.erase(fd);
+                }   
             }
         }
     }
