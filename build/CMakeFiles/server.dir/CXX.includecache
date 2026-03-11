@@ -6,6 +6,10 @@
 
 #IncludeRegexTransform: 
 
+../include/http_request.h
+string
+-
+
 ../include/logger.h
 fstream
 -
@@ -17,6 +21,12 @@ string
 ../include/server.h
 threadpool.h
 ../include/threadpool.h
+unordered_map
+-
+mutex
+-
+ctime
+-
 
 ../include/threadpool.h
 condition_variable
@@ -38,5 +48,33 @@ logger.h
 server.h
 /home/liu/WebServer/src/server.h
 iostream
+-
+
+/home/liu/WebServer/src/server.cpp
+server.h
+/home/liu/WebServer/src/server.h
+http_request.h
+/home/liu/WebServer/src/http_request.h
+logger.h
+/home/liu/WebServer/src/logger.h
+fstream
+-
+arpa/inet.h
+-
+cerrno
+-
+cstring
+-
+fcntl.h
+-
+sstream
+-
+string
+-
+sys/epoll.h
+-
+sys/socket.h
+-
+unistd.h
 -
 
