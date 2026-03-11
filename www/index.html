@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Simple C++ WebServer Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 900px;
+            margin: 40px auto;
+            line-height: 1.8;
+        }
+        code {
+            background: #f4f4f4;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <h1>你好，这是一个 C++ Linux 轻量级 Web 服务器 Demo</h1>
+    <p>当前版本包含：</p>
+    <ul>
+        <li>socket 建立 TCP 监听</li>
+        <li>epoll 监听 I/O 事件</li>
+        <li>线程池处理客户端请求</li>
+        <li>日志系统记录运行状态</li>
+        <li>静态文件返回（当前支持 GET）</li>
+    </ul>
+    <p>你现在访问的是 <code>www/index.html</code></p>
+</body>
+</html>
