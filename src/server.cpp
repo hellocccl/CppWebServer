@@ -2,7 +2,7 @@
 
 #include "http_request.h"
 #include "logger.h"
-
+#include <fstream>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
@@ -13,8 +13,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-Server::Server(int port, int thread_count)
-    : port_(port), server_fd_(-1), epfd_(-1), pool_(thread_count) {}
+Server::Server(int port, int thread_count, const std::string& www_root)
+    : port_(port), server_fd_(-1), epfd_(-1), pool_(thread_count), www_root_(www_root) {}
 
 bool Server::set_nonblocking(int fd) {
     int old_flags = fcntl(fd, F_GETFL, 0);
@@ -96,7 +96,21 @@ bool Server::init() {
     return true;
 }
 
-void Server::handle_client(int client_fd) {
+bool Server::read_file(const std::string& filename, std::string& content) {
+    Logger::instance().debug("尝试读取文件: " + filename);
+    std::ifstream ifs(filename);
+    if (!ifs.is_open()) {
+        Logger::instance().error("无法打开文件: " + filename);
+        return false;
+    }
+
+    std::stringstream buffer;
+    buffer << ifs.rdbuf();
+    content = buffer.str();
+    return true;
+}
+
+void Server::handle_client_impl(int client_fd) {
     char buffer[1024] = {0};
 
     int n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
@@ -126,41 +140,37 @@ void Server::handle_client(int client_fd) {
         ", version = " + request.version()
     );
 
-    std::string body;
+    std::string file_path;
     std::string status_line;
     std::string status_text;
+    std::string body;
 
     if (request.path() == "/") {
+        file_path = www_root_ + "/index.html";
         status_line = "HTTP/1.1 200 OK\r\n";
         status_text = "200 OK";
-        body =
-            "<html>"
-            "<body>"
-            "<h1>首页</h1>"
-            "<p>你访问的是 /</p>"
-            "<p><a href=\"/hello\">访问 /hello</a></p>"
-            "</body>"
-            "</html>";
-    } else if (request.path() == "/hello") {
+    } 
+    else if (request.path() == "/hello") {
+        file_path = www_root_ + "/hello.html";
         status_line = "HTTP/1.1 200 OK\r\n";
         status_text = "200 OK";
-        body =
-            "<html>"
-            "<body>"
-            "<h1>Hello 页面</h1>"
-            "<p>你访问的是 /hello</p>"
-            "<p><a href=\"/\">返回首页</a></p>"
-            "</body>"
-            "</html>";
-    } else {
+    } 
+    else {
+        file_path = www_root_ + "/404.html";
         status_line = "HTTP/1.1 404 Not Found\r\n";
         status_text = "404 Not Found";
+    }
+
+    if (!read_file(file_path, body)) {
+        Logger::instance().error("读取文件失败: " + file_path);
+
+        status_line = "HTTP/1.1 500 Internal Server Error\r\n";
+        status_text = "500 Internal Server Error";
         body =
             "<html>"
             "<body>"
-            "<h1>404 Not Found</h1>"
-            "<p>你访问的路径不存在</p>"
-            "<p><a href=\"/\">返回首页</a></p>"
+            "<h1>500 Internal Server Error</h1>"
+            "<p>服务器读取页面文件失败</p>"
             "</body>"
             "</html>";
     }
@@ -190,6 +200,10 @@ void Server::handle_client(int client_fd) {
 
     close(client_fd);
     Logger::instance().info("连接关闭, fd = " + std::to_string(client_fd));
+}
+
+void Server::handle_client(Server* server, int client_fd) {
+    server->handle_client_impl(client_fd);
 }
 
 void Server::run() {
@@ -281,8 +295,8 @@ void Server::run() {
                     continue;
                 }
 
-                pool_.enqueue([client_fd]() {
-                    Server::handle_client(client_fd);
+                pool_.enqueue([this, client_fd]() {
+                    Server::handle_client(this, client_fd);
                 });
 
                 Logger::instance().debug(

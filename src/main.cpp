@@ -12,7 +12,7 @@ int main() {
     }
 
     // 创建服务器：监听 8080，线程池 4 个线程
-    Server server(8080, 4);
+    Server server(8080, 4, "../www");
 
     if (!server.init()) {
         Logger::instance().error("服务器初始化失败");

@@ -6,10 +6,6 @@
 
 #IncludeRegexTransform: 
 
-../include/http_request.h
-string
--
-
 ../include/logger.h
 fstream
 -
@@ -36,20 +32,6 @@ thread
 vector
 -
 
-/home/liu/WebServer/src/http_request.cpp
-http_request.h
-/home/liu/WebServer/src/http_request.h
-sstream
--
-
-/home/liu/WebServer/src/logger.cpp
-logger.h
-/home/liu/WebServer/src/logger.h
-ctime
--
-iostream
--
-
 /home/liu/WebServer/src/main.cpp
 logger.h
 /home/liu/WebServer/src/logger.h
@@ -57,34 +39,4 @@ server.h
 /home/liu/WebServer/src/server.h
 iostream
 -
-
-/home/liu/WebServer/src/server.cpp
-server.h
-/home/liu/WebServer/src/server.h
-http_request.h
-/home/liu/WebServer/src/http_request.h
-logger.h
-/home/liu/WebServer/src/logger.h
-arpa/inet.h
--
-cerrno
--
-cstring
--
-fcntl.h
--
-sstream
--
-string
--
-sys/epoll.h
--
-sys/socket.h
--
-unistd.h
--
-
-/home/liu/WebServer/src/threadpool.cpp
-threadpool.h
-/home/liu/WebServer/src/threadpool.h
 
