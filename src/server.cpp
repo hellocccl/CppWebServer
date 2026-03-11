@@ -1,5 +1,5 @@
 #include "server.h"
-
+#include "logger.h"
 #include "http_request.h"
 #include "logger.h"
 #include <fstream>
@@ -139,7 +139,6 @@ void Server::handle_client_impl(int client_fd) {
         ", path = " + request.path() +
         ", version = " + request.version()
     );
-
     std::string file_path;
     std::string status_line;
     std::string status_text;
