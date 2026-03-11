@@ -1,3 +1,0 @@
-/mnt/data/simple_webserver/build/CMakeFiles/server.dir
-/mnt/data/simple_webserver/build/CMakeFiles/edit_cache.dir
-/mnt/data/simple_webserver/build/CMakeFiles/rebuild_cache.dir
