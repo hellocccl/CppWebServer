@@ -228,6 +228,11 @@ void Server::handle_client_impl(int client_fd) {
             file_path = www_root_ + "/hello.html";
             status_line = "HTTP/1.1 200 OK\r\n";
             status_text = "200 OK";
+        }
+        else if (request.path() == "/post.html") {
+            file_path = www_root_ + "/post.html";
+            status_line = "HTTP/1.1 200 OK\r\n";
+            status_text = "200 OK";
         } 
         else {
             file_path = www_root_ + "/404.html";
