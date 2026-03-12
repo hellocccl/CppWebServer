@@ -1,8 +1,32 @@
 <html>
 <body>
     <h1>首页</h1>
-    <p>你访问的是 /</p>
+    <p>你访问的是 / ，可直接测试静态资源和 MySQL 注册/登录。</p>
     <p><a href="/hello">访问 /hello</a></p>
     <p><a href="/post.html">访问 POST 测试页</a></p>
+    <p><a href="/sample.txt">访问文本文件 /sample.txt</a></p>
+    <p><a href="/demo.svg">访问图片文件 /demo.svg</a></p>
+
+    <hr />
+    <h2>用户注册（写入 MySQL）</h2>
+    <form action="/register" method="post">
+        <label>用户名：</label>
+        <input type="text" name="username" required />
+        <label>密码：</label>
+        <input type="password" name="password" required />
+        <button type="submit">注册</button>
+    </form>
+
+    <h2>用户登录（MySQL 校验）</h2>
+    <form action="/login" method="post">
+        <label>用户名：</label>
+        <input type="text" name="username" required />
+        <label>密码：</label>
+        <input type="password" name="password" required />
+        <button type="submit">登录</button>
+    </form>
+
+    <h2>示例图片预览</h2>
+    <img src="/demo.svg" alt="demo image" width="320" />
 </body>
 </html>

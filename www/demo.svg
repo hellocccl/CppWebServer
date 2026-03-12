@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="240" viewBox="0 0 640 240">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0B3C5D" />
+      <stop offset="100%" stop-color="#328CC1" />
+    </linearGradient>
+  </defs>
+  <rect width="640" height="240" fill="url(#bg)" />
+  <circle cx="100" cy="120" r="50" fill="#D9B310" />
+  <text x="180" y="110" font-size="38" font-family="sans-serif" fill="#F8F7F3">CppWebServer</text>
+  <text x="180" y="155" font-size="24" font-family="sans-serif" fill="#F8F7F3">MySQL Register / Login Ready</text>
+</svg>

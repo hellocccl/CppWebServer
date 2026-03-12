@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <ctime>
+#include <string>
 class Server {
 private:
     int port_;          // 监听端口
@@ -17,8 +18,10 @@ private:
     
     void check_timeout_connections();
     // 读取文件内容
-    bool read_file(const std::string& filename, std::string& content);
+    bool read_file(const std::string& filename, std::string& content, bool binary = false);
     bool read_http_request(int client_fd, std::string& raw_request);
+    bool resolve_static_path(const std::string& url_path, std::string& file_path) const;
+    std::string content_type_from_path(const std::string& file_path) const;
 
     // 把 fd 设置为非阻塞
     bool set_nonblocking(int fd);

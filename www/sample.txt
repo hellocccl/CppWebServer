@@ -1,0 +1,2 @@
+This is a plain text file served by the C++ web server.
+It verifies static text response with Content-Type: text/plain.

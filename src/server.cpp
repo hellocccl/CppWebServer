@@ -1,18 +1,175 @@
 #include "server.h"
-#include "logger.h"
 #include "http_request.h"
 #include "logger.h"
-#include <fstream>
+
+#include <mysql/mysql.h>
+
+#include <algorithm>
 #include <arpa/inet.h>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
-#include <cctype>
 #include <fcntl.h>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <vector>
+
+namespace {
+// 按用户要求固定数据库连接参数，方便在一个位置集中修改。
+const char* kDbHost = "127.0.0.1";
+const unsigned int kDbPort = 3306;
+const char* kDbUser = "root";
+const char* kDbPassword = "123456789";
+const char* kDbName = "mydb";
+
+std::string to_lower_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+std::string strip_query_and_fragment(std::string path) {
+    size_t query_pos = path.find('?');
+    if (query_pos != std::string::npos) {
+        path = path.substr(0, query_pos);
+    }
+
+    size_t fragment_pos = path.find('#');
+    if (fragment_pos != std::string::npos) {
+        path = path.substr(0, fragment_pos);
+    }
+
+    return path;
+}
+
+int hex_value(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+std::string url_decode(const std::string& input) {
+    std::string output;
+    output.reserve(input.size());
+
+    for (size_t i = 0; i < input.size(); ++i) {
+        if (input[i] == '+' ) {
+            output.push_back(' ');
+            continue;
+        }
+
+        if (input[i] == '%' && i + 2 < input.size()) {
+            int hi = hex_value(input[i + 1]);
+            int lo = hex_value(input[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                output.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+
+        output.push_back(input[i]);
+    }
+
+    return output;
+}
+
+std::unordered_map<std::string, std::string> parse_form_urlencoded(const std::string& body) {
+    std::unordered_map<std::string, std::string> params;
+
+    size_t start = 0;
+    while (start <= body.size()) {
+        size_t end = body.find('&', start);
+        std::string pair = (end == std::string::npos) ? body.substr(start) : body.substr(start, end - start);
+        if (!pair.empty()) {
+            size_t eq = pair.find('=');
+            std::string key = (eq == std::string::npos) ? pair : pair.substr(0, eq);
+            std::string value = (eq == std::string::npos) ? "" : pair.substr(eq + 1);
+            key = url_decode(key);
+            value = url_decode(value);
+            if (!key.empty()) {
+                params[key] = value;
+            }
+        }
+
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    return params;
+}
+
+std::string build_html_message(const std::string& title, const std::string& message) {
+    return "<html>"
+           "<body>"
+           "<h1>" + title + "</h1>"
+           "<p>" + message + "</p>"
+           "<p><a href=\"/\">返回首页</a></p>"
+           "</body>"
+           "</html>";
+}
+
+MYSQL* create_mysql_connection(std::string& error_message) {
+    MYSQL* conn = mysql_init(nullptr);
+    if (!conn) {
+        error_message = "mysql_init 失败";
+        return nullptr;
+    }
+
+    if (!mysql_real_connect(conn, kDbHost, kDbUser, kDbPassword, kDbName, kDbPort, nullptr, 0)) {
+        error_message = mysql_error(conn);
+        mysql_close(conn);
+        return nullptr;
+    }
+
+    // 统一使用 utf8mb4，避免中文字段乱码。
+    mysql_query(conn, "SET NAMES utf8mb4");
+    return conn;
+}
+
+std::string escape_mysql_string(MYSQL* conn, const std::string& raw) {
+    std::vector<char> escaped(raw.size() * 2 + 1, 0);
+    unsigned long len = mysql_real_escape_string(
+        conn,
+        escaped.data(),
+        raw.c_str(),
+        static_cast<unsigned long>(raw.size())
+    );
+    return std::string(escaped.data(), len);
+}
+
+bool send_all(int fd, const std::string& data, size_t& sent_bytes) {
+    sent_bytes = 0;
+    while (sent_bytes < data.size()) {
+        ssize_t n = send(fd, data.data() + sent_bytes, data.size() - sent_bytes, 0);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+        sent_bytes += static_cast<size_t>(n);
+    }
+    return true;
+}
+} // namespace
 
 Server::Server(int port, int thread_count, const std::string& www_root)
     : port_(port), server_fd_(-1), epfd_(-1), pool_(thread_count), www_root_(www_root) {}
@@ -106,21 +263,225 @@ bool Server::init() {
         return false;
     }
 
+    // 启动时完成数据库和用户表初始化，避免运行期间才暴露配置错误。
+    if (!init_database()) {
+        Logger::instance().error("数据库初始化失败");
+        return false;
+    }
+
     Logger::instance().info("已将监听 fd 加入 epoll, server_fd = " + std::to_string(server_fd_));
     return true;
 }
 
-bool Server::read_file(const std::string& filename, std::string& content) {
+bool Server::read_file(const std::string& filename, std::string& content, bool binary) {
     Logger::instance().debug("尝试读取文件: " + filename);
-    std::ifstream ifs(filename);
+
+    std::ios::openmode mode = std::ios::in;
+    if (binary) {
+        mode |= std::ios::binary;
+    }
+
+    std::ifstream ifs(filename.c_str(), mode);
     if (!ifs.is_open()) {
         Logger::instance().error("无法打开文件: " + filename);
         return false;
     }
 
-    std::stringstream buffer;
+    std::ostringstream buffer;
     buffer << ifs.rdbuf();
     content = buffer.str();
+    return true;
+}
+
+bool Server::resolve_static_path(const std::string& url_path, std::string& file_path) const {
+    std::string clean_path = url_decode(strip_query_and_fragment(url_path));
+    if (clean_path.empty()) {
+        clean_path = "/";
+    }
+
+    // 保持原有 /hello 路径兼容，同时把其它路径作为静态文件直接映射。
+    if (clean_path == "/") {
+        clean_path = "/index.html";
+    } else if (clean_path == "/hello") {
+        clean_path = "/hello.html";
+    }
+
+    std::replace(clean_path.begin(), clean_path.end(), '\\', '/');
+
+    // 阻断目录穿越，避免访问 www_root_ 之外的文件。
+    if (clean_path.empty() || clean_path[0] != '/' || clean_path.find("..") != std::string::npos) {
+        return false;
+    }
+
+    file_path = www_root_ + clean_path;
+    return true;
+}
+
+std::string Server::content_type_from_path(const std::string& file_path) const {
+    size_t pos = file_path.find_last_of('.');
+    if (pos == std::string::npos) {
+        return "application/octet-stream";
+    }
+
+    std::string ext = to_lower_copy(file_path.substr(pos));
+    if (ext == ".html" || ext == ".htm") {
+        return "text/html; charset=UTF-8";
+    }
+    if (ext == ".txt") {
+        return "text/plain; charset=UTF-8";
+    }
+    if (ext == ".css") {
+        return "text/css; charset=UTF-8";
+    }
+    if (ext == ".js") {
+        return "application/javascript; charset=UTF-8";
+    }
+    if (ext == ".json") {
+        return "application/json; charset=UTF-8";
+    }
+    if (ext == ".jpg" || ext == ".jpeg") {
+        return "image/jpeg";
+    }
+    if (ext == ".png") {
+        return "image/png";
+    }
+    if (ext == ".gif") {
+        return "image/gif";
+    }
+    if (ext == ".bmp") {
+        return "image/bmp";
+    }
+    if (ext == ".webp") {
+        return "image/webp";
+    }
+    if (ext == ".svg") {
+        return "image/svg+xml";
+    }
+    if (ext == ".ico") {
+        return "image/x-icon";
+    }
+    return "application/octet-stream";
+}
+
+bool Server::init_database() {
+    MYSQL* conn = mysql_init(nullptr);
+    if (!conn) {
+        Logger::instance().error("mysql_init 失败");
+        return false;
+    }
+
+    if (!mysql_real_connect(conn, kDbHost, kDbUser, kDbPassword, nullptr, kDbPort, nullptr, 0)) {
+        Logger::instance().error("连接 MySQL 失败: " + std::string(mysql_error(conn)));
+        mysql_close(conn);
+        return false;
+    }
+
+    mysql_query(conn, "SET NAMES utf8mb4");
+
+    std::string create_db_sql =
+        "CREATE DATABASE IF NOT EXISTS `" + std::string(kDbName) + "` DEFAULT CHARACTER SET utf8mb4";
+    if (mysql_query(conn, create_db_sql.c_str()) != 0) {
+        Logger::instance().error("创建数据库失败: " + std::string(mysql_error(conn)));
+        mysql_close(conn);
+        return false;
+    }
+
+    if (mysql_select_db(conn, kDbName) != 0) {
+        Logger::instance().error("切换数据库失败: " + std::string(mysql_error(conn)));
+        mysql_close(conn);
+        return false;
+    }
+
+    const char* create_table_sql =
+        "CREATE TABLE IF NOT EXISTS users ("
+        "id INT PRIMARY KEY AUTO_INCREMENT,"
+        "username VARCHAR(64) NOT NULL UNIQUE,"
+        "passwd VARCHAR(128) NOT NULL,"
+        "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+
+    if (mysql_query(conn, create_table_sql) != 0) {
+        Logger::instance().error("创建 users 表失败: " + std::string(mysql_error(conn)));
+        mysql_close(conn);
+        return false;
+    }
+
+    mysql_close(conn);
+    Logger::instance().info("MySQL 初始化成功，数据库 = " + std::string(kDbName));
+    return true;
+}
+
+bool Server::register_user(const std::string& username, const std::string& password, std::string& error_message) {
+    std::string db_error;
+    MYSQL* conn = create_mysql_connection(db_error);
+    if (!conn) {
+        error_message = "数据库连接失败: " + db_error;
+        return false;
+    }
+
+    std::string escaped_username = escape_mysql_string(conn, username);
+    std::string escaped_password = escape_mysql_string(conn, password);
+
+    std::string sql =
+        "INSERT INTO users (username, passwd) VALUES ('" + escaped_username + "', '" + escaped_password + "')";
+
+    if (mysql_query(conn, sql.c_str()) != 0) {
+        unsigned int err_no = mysql_errno(conn);
+        if (err_no == 1062) {
+            error_message = "用户名已存在";
+        } else {
+            error_message = "数据库写入失败: " + std::string(mysql_error(conn));
+        }
+        mysql_close(conn);
+        return false;
+    }
+
+    mysql_close(conn);
+    return true;
+}
+
+bool Server::verify_user(const std::string& username, const std::string& password, std::string& error_message) {
+    std::string db_error;
+    MYSQL* conn = create_mysql_connection(db_error);
+    if (!conn) {
+        error_message = "数据库连接失败: " + db_error;
+        return false;
+    }
+
+    std::string escaped_username = escape_mysql_string(conn, username);
+    std::string sql =
+        "SELECT passwd FROM users WHERE username = '" + escaped_username + "' LIMIT 1";
+
+    if (mysql_query(conn, sql.c_str()) != 0) {
+        error_message = "数据库查询失败: " + std::string(mysql_error(conn));
+        mysql_close(conn);
+        return false;
+    }
+
+    MYSQL_RES* result = mysql_store_result(conn);
+    if (!result) {
+        error_message = "数据库结果读取失败: " + std::string(mysql_error(conn));
+        mysql_close(conn);
+        return false;
+    }
+
+    MYSQL_ROW row = mysql_fetch_row(result);
+    if (!row || !row[0]) {
+        error_message = "用户不存在";
+        mysql_free_result(result);
+        mysql_close(conn);
+        return false;
+    }
+
+    std::string stored_password = row[0];
+    mysql_free_result(result);
+    mysql_close(conn);
+
+    if (stored_password != password) {
+        error_message = "密码错误";
+        return false;
+    }
+
     return true;
 }
 
@@ -206,12 +567,14 @@ void Server::handle_client_impl(int client_fd) {
         return;
     }
 
+    std::string request_path = url_decode(strip_query_and_fragment(request.path()));
     Logger::instance().info(
         "解析请求成功, fd = " + std::to_string(client_fd) +
         ", method = " + request.method() +
-        ", path = " + request.path() +
+        ", path = " + request_path +
         ", version = " + request.version()
     );
+
     std::string file_path;
     std::string status_line;
     std::string status_text;
@@ -219,61 +582,91 @@ void Server::handle_client_impl(int client_fd) {
     std::string content_type = "text/html; charset=UTF-8";
 
     if (request.method() == "GET") {
-        if (request.path() == "/") {
-            file_path = www_root_ + "/index.html";
+        if (!resolve_static_path(request_path, file_path)) {
+            status_line = "HTTP/1.1 400 Bad Request\r\n";
+            status_text = "400 Bad Request";
+            body = build_html_message("400 Bad Request", "非法路径");
+        } else if (read_file(file_path, body, true)) {
             status_line = "HTTP/1.1 200 OK\r\n";
             status_text = "200 OK";
-        } 
-        else if (request.path() == "/hello") {
-            file_path = www_root_ + "/hello.html";
-            status_line = "HTTP/1.1 200 OK\r\n";
-            status_text = "200 OK";
-        }
-        else if (request.path() == "/post.html") {
-            file_path = www_root_ + "/post.html";
-            status_line = "HTTP/1.1 200 OK\r\n";
-            status_text = "200 OK";
-        } 
-        else {
+            content_type = content_type_from_path(file_path);
+        } else {
             file_path = www_root_ + "/404.html";
             status_line = "HTTP/1.1 404 Not Found\r\n";
             status_text = "404 Not Found";
-        }
+            content_type = "text/html; charset=UTF-8";
 
-        if (!read_file(file_path, body)) {
-            Logger::instance().error("读取文件失败: " + file_path);
-
-            status_line = "HTTP/1.1 500 Internal Server Error\r\n";
-            status_text = "500 Internal Server Error";
-            body =
-                "<html>"
-                "<body>"
-                "<h1>500 Internal Server Error</h1>"
-                "<p>服务器读取页面文件失败</p>"
-                "</body>"
-                "</html>";
+            if (!read_file(file_path, body, false)) {
+                status_line = "HTTP/1.1 500 Internal Server Error\r\n";
+                status_text = "500 Internal Server Error";
+                body = build_html_message("500 Internal Server Error", "服务器读取页面文件失败");
+            }
         }
     } else if (request.method() == "POST") {
-        if (request.path() == "/post") {
+        if (request_path == "/post") {
             status_line = "HTTP/1.1 200 OK\r\n";
             status_text = "200 OK";
             content_type = "text/plain; charset=UTF-8";
             body = "POST OK\n";
             body += request.body();
+        } else if (request_path == "/register") {
+            auto form = parse_form_urlencoded(request.body());
+            std::string username = form["username"];
+            std::string password = form["password"];
+
+            if (username.empty() || password.empty()) {
+                status_line = "HTTP/1.1 400 Bad Request\r\n";
+                status_text = "400 Bad Request";
+                body = build_html_message("注册失败", "username 或 password 不能为空");
+            } else {
+                std::string error_message;
+                if (register_user(username, password, error_message)) {
+                    status_line = "HTTP/1.1 200 OK\r\n";
+                    status_text = "200 OK";
+                    body = build_html_message("注册成功", "用户已写入 MySQL，可继续登录。");
+                } else if (error_message == "用户名已存在") {
+                    status_line = "HTTP/1.1 409 Conflict\r\n";
+                    status_text = "409 Conflict";
+                    body = build_html_message("注册失败", error_message);
+                } else {
+                    status_line = "HTTP/1.1 500 Internal Server Error\r\n";
+                    status_text = "500 Internal Server Error";
+                    body = build_html_message("注册失败", error_message);
+                }
+            }
+        } else if (request_path == "/login") {
+            auto form = parse_form_urlencoded(request.body());
+            std::string username = form["username"];
+            std::string password = form["password"];
+
+            if (username.empty() || password.empty()) {
+                status_line = "HTTP/1.1 400 Bad Request\r\n";
+                status_text = "400 Bad Request";
+                body = build_html_message("登录失败", "username 或 password 不能为空");
+            } else {
+                std::string error_message;
+                if (verify_user(username, password, error_message)) {
+                    status_line = "HTTP/1.1 200 OK\r\n";
+                    status_text = "200 OK";
+                    body = build_html_message("登录成功", "用户名和密码校验通过。");
+                } else if (error_message == "用户不存在" || error_message == "密码错误") {
+                    status_line = "HTTP/1.1 401 Unauthorized\r\n";
+                    status_text = "401 Unauthorized";
+                    body = build_html_message("登录失败", error_message);
+                } else {
+                    status_line = "HTTP/1.1 500 Internal Server Error\r\n";
+                    status_text = "500 Internal Server Error";
+                    body = build_html_message("登录失败", error_message);
+                }
+            }
         } else {
             file_path = www_root_ + "/404.html";
             status_line = "HTTP/1.1 404 Not Found\r\n";
             status_text = "404 Not Found";
-            if (!read_file(file_path, body)) {
+            if (!read_file(file_path, body, false)) {
                 status_line = "HTTP/1.1 500 Internal Server Error\r\n";
                 status_text = "500 Internal Server Error";
-                body =
-                    "<html>"
-                    "<body>"
-                    "<h1>500 Internal Server Error</h1>"
-                    "<p>服务器读取页面文件失败</p>"
-                    "</body>"
-                    "</html>";
+                body = build_html_message("500 Internal Server Error", "服务器读取页面文件失败");
             }
         }
     } else {
@@ -282,8 +675,9 @@ void Server::handle_client_impl(int client_fd) {
         content_type = "text/plain; charset=UTF-8";
         body = "Method Not Allowed";
     }
+
     bool keep_alive = false;
-    std::string conn_header = request.header("Connection");
+    std::string conn_header = to_lower_copy(request.header("Connection"));
     if (request.version() == "HTTP/1.1") {
         keep_alive = (conn_header != "close");
     } else if (request.version() == "HTTP/1.0") {
@@ -298,8 +692,8 @@ void Server::handle_client_impl(int client_fd) {
         "\r\n" +
         body;
 
-    int sent = send(client_fd, response.c_str(), response.size(), 0);
-    if (sent < 0) {
+    size_t sent = 0;
+    if (!send_all(client_fd, response, sent)) {
         Logger::instance().error(
             "send 失败, fd = " + std::to_string(client_fd) +
             ", errno = " + std::to_string(errno) +
@@ -313,7 +707,7 @@ void Server::handle_client_impl(int client_fd) {
         );
     }
 
-    if (keep_alive && sent >= 0) {
+    if (keep_alive && sent > 0) {
         if (!set_nonblocking(client_fd)) {
             Logger::instance().error("设置 client_fd 非阻塞失败, fd = " + std::to_string(client_fd));
             close(client_fd);
