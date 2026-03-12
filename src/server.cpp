@@ -20,7 +20,7 @@
 
 namespace {
 // 按用户要求固定数据库连接参数，方便在一个位置集中修改。
-const char* kDbHost = "127.0.0.1";
+const char* kDbHost = "localhost";
 const unsigned int kDbPort = 3306;
 const char* kDbUser = "root";
 const char* kDbPassword = "123456789";
@@ -215,7 +215,42 @@ uint32_t Server::conn_epoll_events() const {
 
 void Server::erase_conn_activity(int fd) {
     std::lock_guard<std::mutex> lock(conn_mtx_);
-    last_active_.erase(fd);
+    active_timers_.erase(fd);
+}
+
+void Server::refresh_conn_timer(int fd) {
+    std::lock_guard<std::mutex> lock(conn_mtx_);
+
+    TimerNode node;
+    node.fd = fd;
+    node.expires_at = std::chrono::steady_clock::now() + std::chrono::seconds(kConnectionTimeoutSeconds);
+    active_timers_[fd] = node.expires_at;
+    timer_heap_.push(node);
+}
+
+int Server::next_timeout_ms() {
+    std::lock_guard<std::mutex> lock(conn_mtx_);
+
+    while (!timer_heap_.empty()) {
+        const TimerNode& node = timer_heap_.top();
+        // 堆中可能残留同一 fd 的旧过期时间，和 active_timers_ 对不上时直接丢弃。
+        auto it = active_timers_.find(node.fd);
+        if (it == active_timers_.end() || it->second != node.expires_at) {
+            timer_heap_.pop();
+            continue;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        if (node.expires_at <= now) {
+            return 0;
+        }
+
+        return static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(node.expires_at - now).count()
+        );
+    }
+
+    return -1;
 }
 
 bool Server::add_conn_fd_to_epoll(int client_fd) {
@@ -771,10 +806,7 @@ void Server::process_request_and_respond(int client_fd, const std::string& raw_r
             erase_conn_activity(client_fd);
             return;
         }
-        {
-            std::lock_guard<std::mutex> lock(conn_mtx_);
-            last_active_[client_fd] = std::time(nullptr);
-        }
+        refresh_conn_timer(client_fd);
         Logger::instance().info("保持连接, fd = " + std::to_string(client_fd));
     } else {
         close(client_fd);
@@ -808,23 +840,35 @@ void Server::handle_client(Server* server, int client_fd) {
 }
 
 void Server::check_timeout_connections() {
-    time_t now = std::time(nullptr);
-    const int TIMEOUT = 30; // 30秒超时
+    std::vector<int> expired_fds;
+    {
+        std::lock_guard<std::mutex> lock(conn_mtx_);
+        auto now = std::chrono::steady_clock::now();
 
-    for (auto it = last_active_.begin(); it != last_active_.end(); ) {
-        int fd = it->first;
-        time_t last_time = it->second;
+        while (!timer_heap_.empty()) {
+            const TimerNode& node = timer_heap_.top();
+            // 懒删除：堆顶如果已经不是当前有效定时器，说明它是历史节点，直接弹出。
+            auto it = active_timers_.find(node.fd);
+            if (it == active_timers_.end() || it->second != node.expires_at) {
+                timer_heap_.pop();
+                continue;
+            }
 
-        if (now - last_time > TIMEOUT) {
-            Logger::instance().info(
-                "连接超时，关闭 fd = " + std::to_string(fd)
-            );
-            epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
-            close(fd);
-            it = last_active_.erase(it);
-        } else {
-            ++it;
+            if (node.expires_at > now) {
+                break;
+            }
+
+            expired_fds.push_back(node.fd);
+            active_timers_.erase(it);
+            timer_heap_.pop();
         }
+    }
+
+    for (size_t i = 0; i < expired_fds.size(); ++i) {
+        int fd = expired_fds[i];
+        Logger::instance().info("连接超时，关闭 fd = " + std::to_string(fd));
+        epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
+        close(fd);
     }
 }
 
@@ -833,7 +877,8 @@ void Server::run() {
     epoll_event events[MAX_EVENTS];
 
     while (true) {
-        int nfds = epoll_wait(epfd_, events, MAX_EVENTS, 10000);
+        // 让 epoll 直接睡到“最近一个超时点”，避免固定周期扫描全部连接。
+        int nfds = epoll_wait(epfd_, events, MAX_EVENTS, next_timeout_ms());
         if (nfds == -1) {
             if (errno == EINTR) {
                 check_timeout_connections();
@@ -893,10 +938,7 @@ void Server::run() {
                         close(client_fd);
                         continue;
                     }
-                    {
-                        std::lock_guard<std::mutex> lock(conn_mtx_);
-                        last_active_[client_fd] = std::time(nullptr);
-                    }
+                    refresh_conn_timer(client_fd);
                     Logger::instance().debug(
                         "客户端 fd 已加入 epoll, client_fd = " + std::to_string(client_fd)
                     );
@@ -914,10 +956,6 @@ void Server::run() {
                 Logger::instance().debug(
                     "客户端 fd 可读，准备交给线程池处理, client_fd = " + std::to_string(client_fd)
                 );
-                {
-                    std::lock_guard<std::mutex> lock(conn_mtx_);
-                    last_active_[client_fd] = std::time(nullptr);
-                }
                 if (epoll_ctl(epfd_, EPOLL_CTL_DEL, client_fd, nullptr) == -1) {
                     Logger::instance().error(
                         "epoll_ctl DEL client_fd 失败, fd = " + std::to_string(client_fd) +
@@ -927,6 +965,8 @@ void Server::run() {
                     erase_conn_activity(client_fd);
                     continue;
                 }
+                // 该连接已被线程接管处理，不再算“空闲连接”，先从堆定时器中移除。
+                erase_conn_activity(client_fd);
 
                 if (actor_model_ == 1) {
                     // Reactor：业务线程负责读 + 业务 + 写。

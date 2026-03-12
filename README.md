@@ -37,6 +37,14 @@
   - `2`：listenfd = ET, connfd = LT
   - `3`：listenfd = ET, connfd = ET
 
+### 8) 定时器改为小根堆实现
+- 空闲连接超时不再使用“遍历整个连接表”的线性扫描。
+- 当前实现改为“小根堆 + 懒删除”：
+  - 堆顶永远是最早过期的连接。
+  - `epoll_wait` 的超时时间会动态取“下一个即将过期的连接”。
+  - 连接进入线程池处理时，会先从空闲定时器里移除；只有 keep-alive 重新挂回 epoll 时，才重新入堆。
+- 这样相比原先的 `unordered_map + 全量扫描`，空闲超时检查从每轮 `O(n)` 优化为按到期连接处理，刷新定时器为 `O(log n)`。
+
 ## MySQL 配置
 当前代码固定使用以下配置（位于 `src/server.cpp` 顶部常量）：
 ```cpp
@@ -203,6 +211,7 @@ http://127.0.0.1:8080/xxx.mp4
 - `include/server.h`
   - 新增数据库初始化、注册/登录校验、静态路径解析、MIME 判断等函数声明。
   - 新增并发模型与触发模式字段及辅助函数声明。
+  - 新增基于小根堆的连接定时器数据结构与辅助函数声明。
 - `src/server.cpp`
   - 接入 MySQL C API。
   - 新增 `/register`、`/login` 路由。
@@ -211,6 +220,8 @@ http://127.0.0.1:8080/xxx.mp4
   - 增加 `.mp4 -> video/mp4` 的 MIME 映射。
   - 新增 `listenfd/connfd` 的 LT/ET 事件注册逻辑。
   - 新增 Reactor / 模拟Proactor 两套事件处理分支。
+  - 定时器由线性扫描改为“小根堆 + 懒删除”。
+  - `epoll_wait` 超时时间改为由最近过期连接动态驱动。
 - `CMakeLists.txt`
   - Linux 下新增 `mysqlclient` 链接检查。
 - `www/index.html`

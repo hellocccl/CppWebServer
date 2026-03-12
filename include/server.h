@@ -1,13 +1,26 @@
 #ifndef SERVER_H
 #define SERVER_H
 #include "threadpool.h"
-#include <unordered_map>
-#include <mutex>
-#include <ctime>
 #include <cstdint>
+#include <chrono>
+#include <mutex>
+#include <queue>
 #include <string>
+#include <unordered_map>
+#include <vector>
 class Server {
 private:
+    struct TimerNode {
+        int fd;
+        std::chrono::steady_clock::time_point expires_at;
+    };
+
+    struct TimerNodeCompare {
+        bool operator()(const TimerNode& lhs, const TimerNode& rhs) const {
+            return lhs.expires_at > rhs.expires_at;
+        }
+    };
+
     // 反应堆模型：
     // 0 -> 模拟 Proactor（主线程读，线程池处理业务和写）
     // 1 -> Reactor（线程池负责读 + 业务 + 写）
@@ -24,11 +37,17 @@ private:
     int epfd_;          // epoll 实例 fd
     ThreadPool pool_;   // 线程池
     std::string www_root_; // 网站根目录
-    
-    std::unordered_map<int, time_t> last_active_;
+
+    // 小根堆保存“最早过期”的连接，便于 O(log n) 找到超时连接。
+    std::priority_queue<TimerNode, std::vector<TimerNode>, TimerNodeCompare> timer_heap_;
+    // 记录每个连接当前有效的过期时间，配合堆做懒删除。
+    std::unordered_map<int, std::chrono::steady_clock::time_point> active_timers_;
     std::mutex conn_mtx_;
-    
+    static const int kConnectionTimeoutSeconds = 30;
+
     void check_timeout_connections();
+    int next_timeout_ms();
+    void refresh_conn_timer(int fd);
     // 读取文件内容
     bool read_file(const std::string& filename, std::string& content, bool binary = false);
     bool read_http_request(int client_fd, std::string& raw_request);
