@@ -63,15 +63,25 @@ const char* kDbName = "mydb";
 CREATE TABLE users (
   id INT PRIMARY KEY AUTO_INCREMENT,
   username VARCHAR(64) NOT NULL UNIQUE,
-  passwd VARCHAR(128) NOT NULL,
+  password_hash VARCHAR(64) NOT NULL,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+```
+
+密码存储说明：
+- 注册时不再写入明文密码，而是先生成 `password_hash` 再入库。
+- 登录时不再直接比较明文，而是通过哈希校验函数验证。
+- 当前实现为了简单清晰，直接使用 `SHA-256(password)` 的十六进制字符串。
+- 如果你之前已经建过旧的 `users(passwd)` 表，最简单的处理方式是先删表再重启服务让程序自动重建：
+
+```sql
+DROP TABLE users;
 ```
 
 ## Linux 依赖安装
 ```bash
 sudo apt update
-sudo apt install -y build-essential cmake libmysqlclient-dev mysql-server
+sudo apt install -y build-essential cmake libmysqlclient-dev libssl-dev mysql-server
 ```
 
 ## 编译与运行
@@ -222,12 +232,16 @@ http://127.0.0.1:8080/xxx.mp4
   - 新增 Reactor / 模拟Proactor 两套事件处理分支。
   - 定时器由线性扫描改为“小根堆 + 懒删除”。
   - `epoll_wait` 超时时间改为由最近过期连接动态驱动。
+  - 注册时改为写入 `password_hash`，登录时改为哈希校验。
+- `include/security/password_hash.h`、`src/security/password_hash.cpp`
+  - 新增密码哈希与校验模块。
+  - 当前基于 OpenSSL 的 SHA-256 实现。
 - `CMakeLists.txt`
-  - Linux 下新增 `mysqlclient` 链接检查。
+  - Linux 下新增 `mysqlclient` 与 OpenSSL Crypto 链接检查。
 - `www/index.html`
   - 增加注册/登录表单与文本/图片访问入口。
 - `www/sample.txt`、`www/demo.svg`
   - 新增文本和图片示例资源。
 
 ## 注意
-当前密码以明文存储，仅用于学习。生产环境应使用安全哈希（如 bcrypt/argon2）并启用 HTTPS。
+当前项目已改为存储 `password_hash`，不再保存明文密码。为了代码简单，当前实现使用 SHA-256；如果要进一步提升安全性，生产环境更推荐使用 `bcrypt`、`scrypt` 或 `Argon2`，并启用 HTTPS。

@@ -1,4 +1,5 @@
 #include "db/mysql_user_store.h"
+#include "security/password_hash.h"
 
 #include <mysql/mysql.h>
 
@@ -67,7 +68,7 @@ bool init_database(const MySqlConfig& config, std::string& error_message) {
         "CREATE TABLE IF NOT EXISTS users ("
         "id INT PRIMARY KEY AUTO_INCREMENT,"
         "username VARCHAR(64) NOT NULL UNIQUE,"
-        "passwd VARCHAR(128) NOT NULL,"
+        "password_hash VARCHAR(64) NOT NULL,"
         "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
 
@@ -94,10 +95,15 @@ bool register_user(
     }
 
     std::string escaped_username = escape_mysql_string(conn, username);
-    std::string escaped_password = escape_mysql_string(conn, password);
+    std::string password_hash;
+    if (!security::hash_password(password, password_hash, error_message)) {
+        mysql_close(conn);
+        return false;
+    }
+    std::string escaped_password_hash = escape_mysql_string(conn, password_hash);
 
     std::string sql =
-        "INSERT INTO users (username, passwd) VALUES ('" + escaped_username + "', '" + escaped_password + "')";
+        "INSERT INTO users (username, password_hash) VALUES ('" + escaped_username + "', '" + escaped_password_hash + "')";
 
     if (mysql_query(conn, sql.c_str()) != 0) {
         unsigned int err_no = mysql_errno(conn);
@@ -128,7 +134,7 @@ bool verify_user(
 
     std::string escaped_username = escape_mysql_string(conn, username);
     std::string sql =
-        "SELECT passwd FROM users WHERE username = '" + escaped_username + "' LIMIT 1";
+        "SELECT password_hash FROM users WHERE username = '" + escaped_username + "' LIMIT 1";
 
     if (mysql_query(conn, sql.c_str()) != 0) {
         error_message = "数据库查询失败: " + std::string(mysql_error(conn));
@@ -151,12 +157,14 @@ bool verify_user(
         return false;
     }
 
-    std::string stored_password = row[0];
+    std::string stored_password_hash = row[0];
     mysql_free_result(result);
     mysql_close(conn);
 
-    if (stored_password != password) {
-        error_message = "密码错误";
+    if (!security::verify_password(password, stored_password_hash, error_message)) {
+        if (error_message.empty()) {
+            error_message = "密码错误";
+        }
         return false;
     }
 

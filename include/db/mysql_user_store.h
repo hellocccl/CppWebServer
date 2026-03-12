@@ -16,7 +16,7 @@ struct MySqlConfig {
 // 初始化数据库与 users 表（不存在则自动创建）。
 bool init_database(const MySqlConfig& config, std::string& error_message);
 
-// 用户注册：插入 users(username, passwd)。
+// 用户注册：插入 users(username, password_hash)。
 bool register_user(
     const MySqlConfig& config,
     const std::string& username,
@@ -24,7 +24,7 @@ bool register_user(
     std::string& error_message
 );
 
-// 用户登录：校验 username/password 是否匹配。
+// 用户登录：读取 password_hash 并校验 username/password 是否匹配。
 bool verify_user(
     const MySqlConfig& config,
     const std::string& username,

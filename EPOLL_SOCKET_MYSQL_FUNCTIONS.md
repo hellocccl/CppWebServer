@@ -354,7 +354,7 @@ MYSQL_RES *mysql_store_result(MYSQL *mysql);
 - 作用：
   - 把查询结果集读取到客户端内存。
 - 本项目中：
-  - 登录校验 `SELECT passwd ...` 后获取结果集。
+  - 登录校验 `SELECT password_hash ...` 后获取结果集。
 
 ### 3.7 `mysql_fetch_row`
 - 原型：

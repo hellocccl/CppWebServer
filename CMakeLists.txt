@@ -14,6 +14,7 @@ set(SOURCES
     src/logger.cpp
     src/threadpool.cpp
     src/http_request.cpp
+    src/security/password_hash.cpp
     src/db/mysql_user_store.cpp
     src/server.cpp
 )
@@ -31,5 +32,6 @@ if(UNIX)
     if(NOT MYSQLCLIENT_LIB)
         message(FATAL_ERROR "未找到 mysqlclient，请先安装 libmysqlclient-dev")
     endif()
-    target_link_libraries(server PRIVATE ${MYSQLCLIENT_LIB})
+    find_package(OpenSSL REQUIRED)
+    target_link_libraries(server PRIVATE ${MYSQLCLIENT_LIB} OpenSSL::Crypto)
 endif()
