@@ -171,8 +171,66 @@ bool send_all(int fd, const std::string& data, size_t& sent_bytes) {
 }
 } // namespace
 
-Server::Server(int port, int thread_count, const std::string& www_root)
-    : port_(port), server_fd_(-1), epfd_(-1), pool_(thread_count), www_root_(www_root) {}
+Server::Server(int port, int thread_count, const std::string& www_root, int actor_model, int trig_mode)
+    : actor_model_(actor_model == 1 ? 1 : 0),
+      listen_trig_mode_(0),
+      conn_trig_mode_(0),
+      port_(port),
+      server_fd_(-1),
+      epfd_(-1),
+      pool_(thread_count),
+      www_root_(www_root) {
+    // trig_mode 编码：
+    // 0 -> LT + LT
+    // 1 -> LT + ET
+    // 2 -> ET + LT
+    // 3 -> ET + ET
+    if (trig_mode == 1) {
+        listen_trig_mode_ = 0;
+        conn_trig_mode_ = 1;
+    } else if (trig_mode == 2) {
+        listen_trig_mode_ = 1;
+        conn_trig_mode_ = 0;
+    } else if (trig_mode == 3) {
+        listen_trig_mode_ = 1;
+        conn_trig_mode_ = 1;
+    }
+}
+
+uint32_t Server::listen_epoll_events() const {
+    uint32_t events = EPOLLIN;
+    if (listen_trig_mode_ == 1) {
+        events |= EPOLLET;
+    }
+    return events;
+}
+
+uint32_t Server::conn_epoll_events() const {
+    uint32_t events = EPOLLIN;
+    if (conn_trig_mode_ == 1) {
+        events |= EPOLLET;
+    }
+    return events;
+}
+
+void Server::erase_conn_activity(int fd) {
+    std::lock_guard<std::mutex> lock(conn_mtx_);
+    last_active_.erase(fd);
+}
+
+bool Server::add_conn_fd_to_epoll(int client_fd) {
+    epoll_event client_ev;
+    client_ev.events = conn_epoll_events();
+    client_ev.data.fd = client_fd;
+    if (epoll_ctl(epfd_, EPOLL_CTL_ADD, client_fd, &client_ev) == -1) {
+        Logger::instance().error(
+            "epoll_ctl ADD client_fd 失败, fd = " + std::to_string(client_fd) +
+            ", error = " + std::string(strerror(errno))
+        );
+        return false;
+    }
+    return true;
+}
 
 bool Server::set_nonblocking(int fd) {
     int old_flags = fcntl(fd, F_GETFL, 0);
@@ -255,7 +313,7 @@ bool Server::init() {
 
     // 6. 把监听 fd 加入 epoll
     epoll_event ev;
-    ev.events = EPOLLIN;
+    ev.events = listen_epoll_events();
     ev.data.fd = server_fd_;
 
     if (epoll_ctl(epfd_, EPOLL_CTL_ADD, server_fd_, &ev) == -1) {
@@ -269,6 +327,11 @@ bool Server::init() {
         return false;
     }
 
+    Logger::instance().info(
+        "并发模型 = " + std::string(actor_model_ == 1 ? "Reactor(1)" : "模拟Proactor(0)") +
+        ", listen触发 = " + std::string(listen_trig_mode_ == 1 ? "ET" : "LT") +
+        ", conn触发 = " + std::string(conn_trig_mode_ == 1 ? "ET" : "LT")
+    );
     Logger::instance().info("已将监听 fd 加入 epoll, server_fd = " + std::to_string(server_fd_));
     return true;
 }
@@ -546,28 +609,12 @@ bool Server::read_http_request(int client_fd, std::string& raw_request) {
     }
 }
 
-void Server::handle_client_impl(int client_fd) {
-    if (!set_blocking(client_fd)) {
-        Logger::instance().error("设置 client_fd 阻塞失败, fd = " + std::to_string(client_fd));
-        close(client_fd);
-        return;
-    }
-
-    std::string raw_request;
-    if (!read_http_request(client_fd, raw_request)) {
-        Logger::instance().error("读取请求失败或客户端已关闭连接, fd = " + std::to_string(client_fd));
-        close(client_fd);
-        {
-            std::lock_guard<std::mutex> lock(conn_mtx_);
-            last_active_.erase(client_fd);
-        }
-        return;
-    }
-
+void Server::process_request_and_respond(int client_fd, const std::string& raw_request) {
     HttpRequest request;
     if (!request.parse(raw_request)) {
         Logger::instance().error("HTTP 请求解析失败, fd = " + std::to_string(client_fd));
         close(client_fd);
+        erase_conn_activity(client_fd);
         return;
     }
 
@@ -715,26 +762,13 @@ void Server::handle_client_impl(int client_fd) {
         if (!set_nonblocking(client_fd)) {
             Logger::instance().error("设置 client_fd 非阻塞失败, fd = " + std::to_string(client_fd));
             close(client_fd);
-            {
-                std::lock_guard<std::mutex> lock(conn_mtx_);
-                last_active_.erase(client_fd);
-            }
+            erase_conn_activity(client_fd);
             return;
         }
 
-        epoll_event client_ev;
-        client_ev.events = EPOLLIN;
-        client_ev.data.fd = client_fd;
-        if (epoll_ctl(epfd_, EPOLL_CTL_ADD, client_fd, &client_ev) == -1) {
-            Logger::instance().error(
-                "epoll_ctl ADD client_fd 失败, fd = " + std::to_string(client_fd) +
-                ", error = " + std::string(strerror(errno))
-            );
+        if (!add_conn_fd_to_epoll(client_fd)) {
             close(client_fd);
-            {
-                std::lock_guard<std::mutex> lock(conn_mtx_);
-                last_active_.erase(client_fd);
-            }
+            erase_conn_activity(client_fd);
             return;
         }
         {
@@ -744,12 +778,29 @@ void Server::handle_client_impl(int client_fd) {
         Logger::instance().info("保持连接, fd = " + std::to_string(client_fd));
     } else {
         close(client_fd);
-        {
-            std::lock_guard<std::mutex> lock(conn_mtx_);
-            last_active_.erase(client_fd);
-        }
+        erase_conn_activity(client_fd);
         Logger::instance().info("连接关闭, fd = " + std::to_string(client_fd));
     }
+}
+
+void Server::handle_client_impl(int client_fd) {
+    // Reactor 模式：工作线程负责把请求从 socket 中读出来。
+    if (!set_blocking(client_fd)) {
+        Logger::instance().error("设置 client_fd 阻塞失败, fd = " + std::to_string(client_fd));
+        close(client_fd);
+        erase_conn_activity(client_fd);
+        return;
+    }
+
+    std::string raw_request;
+    if (!read_http_request(client_fd, raw_request)) {
+        Logger::instance().error("读取请求失败或客户端已关闭连接, fd = " + std::to_string(client_fd));
+        close(client_fd);
+        erase_conn_activity(client_fd);
+        return;
+    }
+
+    process_request_and_respond(client_fd, raw_request);
 }
 
 void Server::handle_client(Server* server, int client_fd) {
@@ -802,7 +853,11 @@ void Server::run() {
 
             // 有新连接到来
             if (fd == server_fd_) {
-                while (true) {
+                // listenfd:
+                // LT: 每次事件取一个连接即可（剩余连接下轮仍会触发）。
+                // ET: 必须循环 accept 到 EAGAIN 为止，否则可能漏连接事件。
+                bool continue_accept = true;
+                while (continue_accept) {
                     sockaddr_in client_addr;
                     socklen_t client_len = sizeof(client_addr);
 
@@ -815,7 +870,7 @@ void Server::run() {
                             break;
                         }
                     }
-                    
+
                     char ip[INET_ADDRSTRLEN] = {0};
                     inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
                     int port = ntohs(client_addr.sin_port);
@@ -834,15 +889,7 @@ void Server::run() {
                         continue;
                     }
 
-                    epoll_event client_ev;
-                    client_ev.events = EPOLLIN;
-                    client_ev.data.fd = client_fd;
-
-                    if (epoll_ctl(epfd_, EPOLL_CTL_ADD, client_fd, &client_ev) == -1) {
-                        Logger::instance().error(
-                            "epoll_ctl ADD client_fd 失败, fd = " + std::to_string(client_fd) +
-                            ", error = " + std::string(strerror(errno))
-                        );
+                    if (!add_conn_fd_to_epoll(client_fd)) {
                         close(client_fd);
                         continue;
                     }
@@ -853,6 +900,11 @@ void Server::run() {
                     Logger::instance().debug(
                         "客户端 fd 已加入 epoll, client_fd = " + std::to_string(client_fd)
                     );
+
+                    // LT 模式下，本轮只处理一个新连接。
+                    if (listen_trig_mode_ == 0) {
+                        continue_accept = false;
+                    }
                 }
             }
             // 客户端可读
@@ -872,20 +924,42 @@ void Server::run() {
                         ", error = " + std::string(strerror(errno))
                     );
                     close(client_fd);
-                    {
-                        std::lock_guard<std::mutex> lock(conn_mtx_);
-                        last_active_.erase(client_fd);
-                    }   
+                    erase_conn_activity(client_fd);
                     continue;
                 }
-                
-                pool_.enqueue([this, client_fd]() {
-                    Server::handle_client(this, client_fd);
-                });
 
-                Logger::instance().debug(
-                    "任务已加入线程池, client_fd = " + std::to_string(client_fd)
-                );
+                if (actor_model_ == 1) {
+                    // Reactor：业务线程负责读 + 业务 + 写。
+                    pool_.enqueue([this, client_fd]() {
+                        Server::handle_client(this, client_fd);
+                    });
+                    Logger::instance().debug(
+                        "Reactor 任务已加入线程池, client_fd = " + std::to_string(client_fd)
+                    );
+                } else {
+                    // 模拟 Proactor：主线程先完成读，再把“已读请求”交给线程池处理业务。
+                    if (!set_blocking(client_fd)) {
+                        Logger::instance().error("设置 client_fd 阻塞失败, fd = " + std::to_string(client_fd));
+                        close(client_fd);
+                        erase_conn_activity(client_fd);
+                        continue;
+                    }
+
+                    std::string raw_request;
+                    if (!read_http_request(client_fd, raw_request)) {
+                        Logger::instance().error("主线程读取请求失败, fd = " + std::to_string(client_fd));
+                        close(client_fd);
+                        erase_conn_activity(client_fd);
+                        continue;
+                    }
+
+                    pool_.enqueue([this, client_fd, raw_request]() {
+                        process_request_and_respond(client_fd, raw_request);
+                    });
+                    Logger::instance().debug(
+                        "模拟Proactor任务已加入线程池, client_fd = " + std::to_string(client_fd)
+                    );
+                }
             }
             // 其它异常
             else {
@@ -896,10 +970,7 @@ void Server::run() {
                 );
                 epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
                 close(fd);
-                {
-                    std::lock_guard<std::mutex> lock(conn_mtx_);
-                    last_active_.erase(fd);
-                }   
+                erase_conn_activity(fd);
             }
         }
     }
