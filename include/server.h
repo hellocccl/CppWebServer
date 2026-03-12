@@ -22,6 +22,9 @@ private:
     bool read_http_request(int client_fd, std::string& raw_request);
     bool resolve_static_path(const std::string& url_path, std::string& file_path) const;
     std::string content_type_from_path(const std::string& file_path) const;
+    bool init_database();
+    bool register_user(const std::string& username, const std::string& password, std::string& error_message);
+    bool verify_user(const std::string& username, const std::string& password, std::string& error_message);
 
     // 把 fd 设置为非阻塞
     bool set_nonblocking(int fd);
