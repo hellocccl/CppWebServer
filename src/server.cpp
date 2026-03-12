@@ -357,6 +357,10 @@ std::string Server::content_type_from_path(const std::string& file_path) const {
     if (ext == ".svg") {
         return "image/svg+xml";
     }
+    if (ext == ".mp4") {
+        // 让浏览器按视频资源处理 mp4，而不是当作普通二进制下载。
+        return "video/mp4";
+    }
     if (ext == ".ico") {
         return "image/x-icon";
     }

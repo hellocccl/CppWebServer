@@ -3,7 +3,7 @@
 #include <ctime>
 #include <iostream>
 
-Logger::Logger() : to_file_(false) {}
+Logger::Logger() : to_file_(false), write_mode_(0), stop_worker_(false) {}
 
 Logger& Logger::instance() {
     static Logger logger;
@@ -20,31 +20,112 @@ std::string Logger::get_time_string() {
 }
 
 void Logger::log(const std::string& level, const std::string& message) {
-    std::lock_guard<std::mutex> lock(mtx_);
+    std::string line;
+    bool need_async_enqueue = false;
 
-    std::string line = "[" + get_time_string() + "][" + level + "] " + message;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        line = "[" + get_time_string() + "][" + level + "] " + message;
 
-    // 输出到控制台
-    if (level == "ERROR") {
-        std::cerr << line << std::endl;
-    } else {
-        std::cout << line << std::endl;
+        // 控制台仍然实时输出，便于调试。
+        if (level == "ERROR") {
+            std::cerr << line << std::endl;
+        } else {
+            std::cout << line << std::endl;
+        }
+
+        if (!to_file_ || !file_.is_open()) {
+            return;
+        }
+
+        if (write_mode_ == 0) {
+            // 同步模式：业务线程直接写文件并 flush。
+            file_ << line << std::endl;
+            file_.flush();
+        } else {
+            // 异步模式：业务线程只负责入队，不直接刷盘。
+            need_async_enqueue = true;
+        }
     }
 
-    // 如果开启了文件输出，也写入文件
-    if (to_file_ && file_.is_open()) {
-        file_ << line << std::endl;
-        file_.flush();
+    if (need_async_enqueue) {
+        {
+            std::lock_guard<std::mutex> lock(queue_mtx_);
+            async_queue_.push(line);
+        }
+        queue_cv_.notify_one();
     }
 }
 
-bool Logger::init(const std::string& filename) {
-    std::lock_guard<std::mutex> lock(mtx_);
-    file_.open(filename, std::ios::app);
-    if (!file_.is_open()) {
-        return false;
+void Logger::async_write_loop() {
+    while (true) {
+        std::string line;
+        {
+            std::unique_lock<std::mutex> lock(queue_mtx_);
+            queue_cv_.wait(lock, [this]() { return stop_worker_ || !async_queue_.empty(); });
+
+            if (stop_worker_ && async_queue_.empty()) {
+                break;
+            }
+
+            line = async_queue_.front();
+            async_queue_.pop();
+        }
+
+        // 只有后台线程写文件，减少业务线程 I/O 阻塞。
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (to_file_ && file_.is_open()) {
+            file_ << line << std::endl;
+            file_.flush();
+        }
     }
-    to_file_ = true;
+}
+
+void Logger::stop_async_worker() {
+    bool joinable = false;
+    {
+        std::lock_guard<std::mutex> lock(queue_mtx_);
+        if (worker_.joinable()) {
+            stop_worker_ = true;
+            joinable = true;
+        }
+    }
+
+    if (joinable) {
+        queue_cv_.notify_all();
+        worker_.join();
+    }
+}
+
+bool Logger::init(const std::string& filename, int write_mode) {
+    stop_async_worker();
+
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (file_.is_open()) {
+            file_.close();
+        }
+
+        file_.open(filename, std::ios::app);
+        if (!file_.is_open()) {
+            to_file_ = false;
+            return false;
+        }
+
+        to_file_ = true;
+        write_mode_ = (write_mode == 1) ? 1 : 0;
+    }
+
+    if (write_mode_ == 1) {
+        {
+            std::lock_guard<std::mutex> lock(queue_mtx_);
+            stop_worker_ = false;
+            std::queue<std::string> empty;
+            std::swap(async_queue_, empty);
+        }
+        worker_ = std::thread(&Logger::async_write_loop, this);
+    }
+    
     return true;
 }
 
@@ -58,4 +139,13 @@ void Logger::error(const std::string& message) {
 
 void Logger::debug(const std::string& message) {
     log("DEBUG", message);
+}
+
+Logger::~Logger() {
+    stop_async_worker();
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (file_.is_open()) {
+        file_.flush();
+        file_.close();
+    }
 }
