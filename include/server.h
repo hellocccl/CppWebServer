@@ -18,9 +18,11 @@ private:
     void check_timeout_connections();
     // 读取文件内容
     bool read_file(const std::string& filename, std::string& content);
+    bool read_http_request(int client_fd, std::string& raw_request);
 
     // 把 fd 设置为非阻塞
     bool set_nonblocking(int fd);
+    bool set_blocking(int fd);
     // 处理一个客户端连接
     static void handle_client(Server* server, int client_fd);
     void handle_client_impl(int client_fd);
