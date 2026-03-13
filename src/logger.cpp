@@ -3,7 +3,19 @@
 #include <ctime>
 #include <iostream>
 
-Logger::Logger() : to_file_(false), write_mode_(0), stop_worker_(false) {}
+namespace {
+int level_to_value(const std::string& level) {
+    if (level == "ERROR") {
+        return 0;
+    }
+    if (level == "DEBUG") {
+        return 2;
+    }
+    return 1;
+}
+} // namespace
+
+Logger::Logger() : to_file_(false), write_mode_(0), min_level_(kInfo), stop_worker_(false) {}
 
 Logger& Logger::instance() {
     static Logger logger;
@@ -19,7 +31,15 @@ std::string Logger::get_time_string() {
     return std::string(buffer);
 }
 
+bool Logger::should_log(const std::string& level) const {
+    return level_to_value(level) <= min_level_;
+}
+
 void Logger::log(const std::string& level, const std::string& message) {
+    if (!should_log(level)) {
+        return;
+    }
+
     std::string line;
     bool need_async_enqueue = false;
 
@@ -29,9 +49,9 @@ void Logger::log(const std::string& level, const std::string& message) {
 
         // 控制台仍然实时输出，便于调试。
         if (level == "ERROR") {
-            std::cerr << line << std::endl;
+            std::cerr << line << '\n';
         } else {
-            std::cout << line << std::endl;
+            std::cout << line << '\n';
         }
 
         if (!to_file_ || !file_.is_open()) {
@@ -39,9 +59,8 @@ void Logger::log(const std::string& level, const std::string& message) {
         }
 
         if (write_mode_ == 0) {
-            // 同步模式：业务线程直接写文件并 flush。
-            file_ << line << std::endl;
-            file_.flush();
+            // 同步模式：业务线程直接写文件，避免每行 flush 放大 I/O 开销。
+            file_ << line << '\n';
         } else {
             // 异步模式：业务线程只负责入队，不直接刷盘。
             need_async_enqueue = true;
@@ -75,8 +94,7 @@ void Logger::async_write_loop() {
         // 只有后台线程写文件，减少业务线程 I/O 阻塞。
         std::lock_guard<std::mutex> lock(mtx_);
         if (to_file_ && file_.is_open()) {
-            file_ << line << std::endl;
-            file_.flush();
+            file_ << line << '\n';
         }
     }
 }
@@ -127,6 +145,17 @@ bool Logger::init(const std::string& filename, int write_mode) {
     }
     
     return true;
+}
+
+void Logger::set_level(int level) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (level <= kError) {
+        min_level_ = kError;
+    } else if (level >= kDebug) {
+        min_level_ = kDebug;
+    } else {
+        min_level_ = kInfo;
+    }
 }
 
 void Logger::info(const std::string& message) {

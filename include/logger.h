@@ -10,10 +10,17 @@
 
 class Logger {
 private:
+    enum Level {
+        kError = 0,
+        kInfo = 1,
+        kDebug = 2
+    };
+
     std::mutex mtx_;          // 保证多线程写日志安全
     std::ofstream file_;      // 日志文件输出流
     bool to_file_;            // 是否写入文件
     int write_mode_;          // 0: 同步写日志 1: 异步写日志
+    int min_level_;           // 当前最小输出级别
 
     // 仅在异步模式下使用：业务线程把日志行放入队列，由后台线程统一刷盘。
     std::mutex queue_mtx_;
@@ -32,6 +39,7 @@ private:
     void log(const std::string& level, const std::string& message);
     void async_write_loop();
     void stop_async_worker();
+    bool should_log(const std::string& level) const;
 
 public:
     // 删除拷贝构造和赋值，保证单例
@@ -46,6 +54,12 @@ public:
     // 1 -> 异步写入（后台线程写文件）
     bool init(const std::string& filename, int write_mode = 0);
     ~Logger();
+
+    // level:
+    // 0 -> ERROR
+    // 1 -> INFO
+    // 2 -> DEBUG
+    void set_level(int level);
 
     void info(const std::string& message);
     void error(const std::string& message);

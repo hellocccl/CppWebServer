@@ -3,6 +3,7 @@
 #include "threadpool.h"
 #include <cstdint>
 #include <chrono>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -19,6 +20,11 @@ private:
         bool operator()(const TimerNode& lhs, const TimerNode& rhs) const {
             return lhs.expires_at > rhs.expires_at;
         }
+    };
+
+    struct StaticFileCacheEntry {
+        std::string body;
+        std::string content_type;
     };
 
     // 反应堆模型：
@@ -43,13 +49,16 @@ private:
     // 记录每个连接当前有效的过期时间，配合堆做懒删除。
     std::unordered_map<int, std::chrono::steady_clock::time_point> active_timers_;
     std::mutex conn_mtx_;
+    std::unordered_map<std::string, std::shared_ptr<const StaticFileCacheEntry>> static_file_cache_;
+    std::mutex static_file_cache_mtx_;
     static const int kConnectionTimeoutSeconds = 30;
 
     void check_timeout_connections();
     int next_timeout_ms();
     void refresh_conn_timer(int fd);
     // 读取文件内容
-    bool read_file(const std::string& filename, std::string& content, bool binary = false);
+    bool read_file(const std::string& filename, std::string& content);
+    std::shared_ptr<const StaticFileCacheEntry> get_static_file(const std::string& file_path);
     bool read_http_request(int client_fd, std::string& raw_request);
     bool resolve_static_path(const std::string& url_path, std::string& file_path) const;
     std::string content_type_from_path(const std::string& file_path) const;
@@ -57,6 +66,7 @@ private:
     bool register_user(const std::string& username, const std::string& password, std::string& error_message);
     bool verify_user(const std::string& username, const std::string& password, std::string& error_message);
     void process_request_and_respond(int client_fd, const std::string& raw_request);
+    bool send_response_parts(int client_fd, const std::string& headers, const std::string& body, size_t& sent_bytes) const;
     uint32_t listen_epoll_events() const;
     uint32_t conn_epoll_events() const;
     bool add_conn_fd_to_epoll(int client_fd);

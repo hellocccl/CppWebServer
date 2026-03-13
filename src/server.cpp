@@ -16,6 +16,7 @@
 #include <string>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <vector>
 
@@ -26,6 +27,7 @@ const unsigned int kDbPort = 3306;
 const char* kDbUser = "root";
 const char* kDbPassword = "123456789";
 const char* kDbName = "mydb";
+const size_t kMaxCachedFileBytes = 1024 * 1024;
 
 std::string to_lower_copy(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -153,23 +155,6 @@ std::string escape_mysql_string(MYSQL* conn, const std::string& raw) {
     return std::string(escaped.data(), len);
 }
 
-bool send_all(int fd, const std::string& data, size_t& sent_bytes) {
-    sent_bytes = 0;
-    while (sent_bytes < data.size()) {
-        ssize_t n = send(fd, data.data() + sent_bytes, data.size() - sent_bytes, 0);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return false;
-        }
-        if (n == 0) {
-            return false;
-        }
-        sent_bytes += static_cast<size_t>(n);
-    }
-    return true;
-}
 } // namespace
 
 const int Server::kConnectionTimeoutSeconds;
@@ -333,7 +318,7 @@ bool Server::init() {
     }
 
     // 4. listen
-    if (listen(server_fd_, 10) == -1) {
+    if (listen(server_fd_, SOMAXCONN) == -1) {
         Logger::instance().error("listen 失败: " + std::string(strerror(errno)));
         return false;
     }
@@ -374,24 +359,63 @@ bool Server::init() {
     return true;
 }
 
-bool Server::read_file(const std::string& filename, std::string& content, bool binary) {
+bool Server::read_file(const std::string& filename, std::string& content) {
     Logger::instance().debug("尝试读取文件: " + filename);
 
-    std::ios::openmode mode = std::ios::in;
-    if (binary) {
-        mode |= std::ios::binary;
-    }
-
-    std::ifstream ifs(filename.c_str(), mode);
+    std::ifstream ifs(filename.c_str(), std::ios::in | std::ios::binary);
     if (!ifs.is_open()) {
         Logger::instance().error("无法打开文件: " + filename);
         return false;
     }
 
-    std::ostringstream buffer;
-    buffer << ifs.rdbuf();
-    content = buffer.str();
+    ifs.seekg(0, std::ios::end);
+    std::streamoff size = ifs.tellg();
+    if (size < 0) {
+        Logger::instance().error("读取文件大小失败: " + filename);
+        return false;
+    }
+
+    content.resize(static_cast<size_t>(size));
+    ifs.seekg(0, std::ios::beg);
+    if (size > 0) {
+        ifs.read(&content[0], static_cast<std::streamsize>(size));
+        if (!ifs) {
+            Logger::instance().error("读取文件内容失败: " + filename);
+            return false;
+        }
+    }
+
     return true;
+}
+
+std::shared_ptr<const Server::StaticFileCacheEntry> Server::get_static_file(const std::string& file_path) {
+    {
+        std::lock_guard<std::mutex> lock(static_file_cache_mtx_);
+        auto it = static_file_cache_.find(file_path);
+        if (it != static_file_cache_.end()) {
+            return it->second;
+        }
+    }
+
+    std::string content;
+    if (!read_file(file_path, content)) {
+        return std::shared_ptr<const StaticFileCacheEntry>();
+    }
+
+    std::shared_ptr<StaticFileCacheEntry> entry(new StaticFileCacheEntry());
+    entry->body.swap(content);
+    entry->content_type = content_type_from_path(file_path);
+
+    if (entry->body.size() <= kMaxCachedFileBytes) {
+        std::lock_guard<std::mutex> lock(static_file_cache_mtx_);
+        std::shared_ptr<const StaticFileCacheEntry>& slot = static_file_cache_[file_path];
+        if (!slot) {
+            slot = entry;
+        }
+        return slot;
+    }
+
+    return entry;
 }
 
 bool Server::resolve_static_path(const std::string& url_path, std::string& file_path) const {
@@ -654,6 +678,58 @@ bool Server::read_http_request(int client_fd, std::string& raw_request) {
     }
 }
 
+bool Server::send_response_parts(
+    int client_fd,
+    const std::string& headers,
+    const std::string& body,
+    size_t& sent_bytes
+) const {
+    sent_bytes = 0;
+    size_t headers_sent = 0;
+    size_t body_sent = 0;
+
+    while (headers_sent < headers.size() || body_sent < body.size()) {
+        iovec iov[2];
+        int iov_count = 0;
+        if (headers_sent < headers.size()) {
+            iov[iov_count].iov_base = const_cast<char*>(headers.data() + headers_sent);
+            iov[iov_count].iov_len = headers.size() - headers_sent;
+            ++iov_count;
+        }
+        if (body_sent < body.size()) {
+            iov[iov_count].iov_base = const_cast<char*>(body.data() + body_sent);
+            iov[iov_count].iov_len = body.size() - body_sent;
+            ++iov_count;
+        }
+
+        ssize_t n = writev(client_fd, iov, iov_count);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+
+        sent_bytes += static_cast<size_t>(n);
+        size_t remaining = static_cast<size_t>(n);
+
+        if (headers_sent < headers.size()) {
+            size_t headers_remaining = headers.size() - headers_sent;
+            size_t consumed_headers = std::min(remaining, headers_remaining);
+            headers_sent += consumed_headers;
+            remaining -= consumed_headers;
+        }
+        if (remaining > 0) {
+            body_sent += remaining;
+        }
+    }
+
+    return true;
+}
+
 void Server::process_request_and_respond(int client_fd, const std::string& raw_request) {
     HttpRequest request;
     if (!request.parse(raw_request)) {
@@ -664,7 +740,7 @@ void Server::process_request_and_respond(int client_fd, const std::string& raw_r
     }
 
     std::string request_path = url_decode(strip_query_and_fragment(request.path()));
-    Logger::instance().info(
+    Logger::instance().debug(
         "解析请求成功, fd = " + std::to_string(client_fd) +
         ", method = " + request.method() +
         ", path = " + request_path +
@@ -675,24 +751,28 @@ void Server::process_request_and_respond(int client_fd, const std::string& raw_r
     std::string status_line;
     std::string status_text;
     std::string body;
+    const std::string* response_body = &body;
     std::string content_type = "text/html; charset=UTF-8";
+    std::shared_ptr<const StaticFileCacheEntry> static_file;
 
     if (request.method() == "GET") {
         if (!resolve_static_path(request_path, file_path)) {
             status_line = "HTTP/1.1 400 Bad Request\r\n";
             status_text = "400 Bad Request";
             body = build_html_message("400 Bad Request", "非法路径");
-        } else if (read_file(file_path, body, true)) {
+        } else if ((static_file = get_static_file(file_path))) {
             status_line = "HTTP/1.1 200 OK\r\n";
             status_text = "200 OK";
-            content_type = content_type_from_path(file_path);
+            content_type = static_file->content_type;
+            response_body = &static_file->body;
         } else {
             file_path = www_root_ + "/404.html";
             status_line = "HTTP/1.1 404 Not Found\r\n";
             status_text = "404 Not Found";
-            content_type = "text/html; charset=UTF-8";
-
-            if (!read_file(file_path, body, false)) {
+            if ((static_file = get_static_file(file_path))) {
+                content_type = static_file->content_type;
+                response_body = &static_file->body;
+            } else {
                 status_line = "HTTP/1.1 500 Internal Server Error\r\n";
                 status_text = "500 Internal Server Error";
                 body = build_html_message("500 Internal Server Error", "服务器读取页面文件失败");
@@ -759,7 +839,10 @@ void Server::process_request_and_respond(int client_fd, const std::string& raw_r
             file_path = www_root_ + "/404.html";
             status_line = "HTTP/1.1 404 Not Found\r\n";
             status_text = "404 Not Found";
-            if (!read_file(file_path, body, false)) {
+            if ((static_file = get_static_file(file_path))) {
+                content_type = static_file->content_type;
+                response_body = &static_file->body;
+            } else {
                 status_line = "HTTP/1.1 500 Internal Server Error\r\n";
                 status_text = "500 Internal Server Error";
                 body = build_html_message("500 Internal Server Error", "服务器读取页面文件失败");
@@ -780,23 +863,23 @@ void Server::process_request_and_respond(int client_fd, const std::string& raw_r
         keep_alive = (conn_header == "keep-alive");
     }
 
-    std::string response =
-        status_line +
-        "Content-Type: " + content_type + "\r\n"
-        "Content-Length: " + std::to_string(body.size()) + "\r\n"
-        "Connection: " + std::string(keep_alive ? "keep-alive" : "close") + "\r\n"
-        "\r\n" +
-        body;
+    std::string response_headers;
+    response_headers.reserve(128 + content_type.size());
+    response_headers += status_line;
+    response_headers += "Content-Type: " + content_type + "\r\n";
+    response_headers += "Content-Length: " + std::to_string(response_body->size()) + "\r\n";
+    response_headers += "Connection: " + std::string(keep_alive ? "keep-alive" : "close") + "\r\n";
+    response_headers += "\r\n";
 
     size_t sent = 0;
-    if (!send_all(client_fd, response, sent)) {
+    if (!send_response_parts(client_fd, response_headers, *response_body, sent)) {
         Logger::instance().error(
             "send 失败, fd = " + std::to_string(client_fd) +
             ", errno = " + std::to_string(errno) +
             ", error = " + std::string(strerror(errno))
         );
     } else {
-        Logger::instance().info(
+        Logger::instance().debug(
             "响应发送成功, fd = " + std::to_string(client_fd) +
             ", status = " + status_text +
             ", bytes = " + std::to_string(sent)
@@ -817,11 +900,11 @@ void Server::process_request_and_respond(int client_fd, const std::string& raw_r
             return;
         }
         refresh_conn_timer(client_fd);
-        Logger::instance().info("保持连接, fd = " + std::to_string(client_fd));
+        Logger::instance().debug("保持连接, fd = " + std::to_string(client_fd));
     } else {
         close(client_fd);
         erase_conn_activity(client_fd);
-        Logger::instance().info("连接关闭, fd = " + std::to_string(client_fd));
+        Logger::instance().debug("连接关闭, fd = " + std::to_string(client_fd));
     }
 }
 
@@ -876,7 +959,7 @@ void Server::check_timeout_connections() {
 
     for (size_t i = 0; i < expired_fds.size(); ++i) {
         int fd = expired_fds[i];
-        Logger::instance().info("连接超时，关闭 fd = " + std::to_string(fd));
+        Logger::instance().debug("连接超时，关闭 fd = " + std::to_string(fd));
         epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
         close(fd);
     }
@@ -930,7 +1013,7 @@ void Server::run() {
                     inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
                     int port = ntohs(client_addr.sin_port);
 
-                    Logger::instance().info(
+                    Logger::instance().debug(
                         "有客户端连接, fd = " + std::to_string(client_fd) +
                         ", ip = " + std::string(ip) +
                         ", port = " + std::to_string(port)
