@@ -109,9 +109,35 @@ CMakeFiles/server.dir/src/http_request.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/server.dir/src/http_request.cpp.s"
 	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/liu/WebServer/src/http_request.cpp -o CMakeFiles/server.dir/src/http_request.cpp.s
 
+CMakeFiles/server.dir/src/security/password_hash.cpp.o: CMakeFiles/server.dir/flags.make
+CMakeFiles/server.dir/src/security/password_hash.cpp.o: ../src/security/password_hash.cpp
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/liu/WebServer/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Building CXX object CMakeFiles/server.dir/src/security/password_hash.cpp.o"
+	/usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/server.dir/src/security/password_hash.cpp.o -c /home/liu/WebServer/src/security/password_hash.cpp
+
+CMakeFiles/server.dir/src/security/password_hash.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/server.dir/src/security/password_hash.cpp.i"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/liu/WebServer/src/security/password_hash.cpp > CMakeFiles/server.dir/src/security/password_hash.cpp.i
+
+CMakeFiles/server.dir/src/security/password_hash.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/server.dir/src/security/password_hash.cpp.s"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/liu/WebServer/src/security/password_hash.cpp -o CMakeFiles/server.dir/src/security/password_hash.cpp.s
+
+CMakeFiles/server.dir/src/db/mysql_user_store.cpp.o: CMakeFiles/server.dir/flags.make
+CMakeFiles/server.dir/src/db/mysql_user_store.cpp.o: ../src/db/mysql_user_store.cpp
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/liu/WebServer/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_6) "Building CXX object CMakeFiles/server.dir/src/db/mysql_user_store.cpp.o"
+	/usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/server.dir/src/db/mysql_user_store.cpp.o -c /home/liu/WebServer/src/db/mysql_user_store.cpp
+
+CMakeFiles/server.dir/src/db/mysql_user_store.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/server.dir/src/db/mysql_user_store.cpp.i"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/liu/WebServer/src/db/mysql_user_store.cpp > CMakeFiles/server.dir/src/db/mysql_user_store.cpp.i
+
+CMakeFiles/server.dir/src/db/mysql_user_store.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/server.dir/src/db/mysql_user_store.cpp.s"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/liu/WebServer/src/db/mysql_user_store.cpp -o CMakeFiles/server.dir/src/db/mysql_user_store.cpp.s
+
 CMakeFiles/server.dir/src/server.cpp.o: CMakeFiles/server.dir/flags.make
 CMakeFiles/server.dir/src/server.cpp.o: ../src/server.cpp
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/liu/WebServer/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Building CXX object CMakeFiles/server.dir/src/server.cpp.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/liu/WebServer/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_7) "Building CXX object CMakeFiles/server.dir/src/server.cpp.o"
 	/usr/bin/c++  $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -o CMakeFiles/server.dir/src/server.cpp.o -c /home/liu/WebServer/src/server.cpp
 
 CMakeFiles/server.dir/src/server.cpp.i: cmake_force
@@ -128,6 +154,8 @@ server_OBJECTS = \
 "CMakeFiles/server.dir/src/logger.cpp.o" \
 "CMakeFiles/server.dir/src/threadpool.cpp.o" \
 "CMakeFiles/server.dir/src/http_request.cpp.o" \
+"CMakeFiles/server.dir/src/security/password_hash.cpp.o" \
+"CMakeFiles/server.dir/src/db/mysql_user_store.cpp.o" \
 "CMakeFiles/server.dir/src/server.cpp.o"
 
 # External object files for target server
@@ -137,10 +165,14 @@ server: CMakeFiles/server.dir/src/main.cpp.o
 server: CMakeFiles/server.dir/src/logger.cpp.o
 server: CMakeFiles/server.dir/src/threadpool.cpp.o
 server: CMakeFiles/server.dir/src/http_request.cpp.o
+server: CMakeFiles/server.dir/src/security/password_hash.cpp.o
+server: CMakeFiles/server.dir/src/db/mysql_user_store.cpp.o
 server: CMakeFiles/server.dir/src/server.cpp.o
 server: CMakeFiles/server.dir/build.make
+server: /usr/lib/x86_64-linux-gnu/libmysqlclient.so
+server: /usr/lib/x86_64-linux-gnu/libcrypto.so
 server: CMakeFiles/server.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/liu/WebServer/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_6) "Linking CXX executable server"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/liu/WebServer/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_8) "Linking CXX executable server"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/server.dir/link.txt --verbose=$(VERBOSE)
 
 # Rule to build all files generated by this target.

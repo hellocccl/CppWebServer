@@ -123,6 +123,33 @@ server/fast:
 	$(MAKE) -f CMakeFiles/server.dir/build.make CMakeFiles/server.dir/build
 .PHONY : server/fast
 
+src/db/mysql_user_store.o: src/db/mysql_user_store.cpp.o
+
+.PHONY : src/db/mysql_user_store.o
+
+# target to build an object file
+src/db/mysql_user_store.cpp.o:
+	$(MAKE) -f CMakeFiles/server.dir/build.make CMakeFiles/server.dir/src/db/mysql_user_store.cpp.o
+.PHONY : src/db/mysql_user_store.cpp.o
+
+src/db/mysql_user_store.i: src/db/mysql_user_store.cpp.i
+
+.PHONY : src/db/mysql_user_store.i
+
+# target to preprocess a source file
+src/db/mysql_user_store.cpp.i:
+	$(MAKE) -f CMakeFiles/server.dir/build.make CMakeFiles/server.dir/src/db/mysql_user_store.cpp.i
+.PHONY : src/db/mysql_user_store.cpp.i
+
+src/db/mysql_user_store.s: src/db/mysql_user_store.cpp.s
+
+.PHONY : src/db/mysql_user_store.s
+
+# target to generate assembly for a file
+src/db/mysql_user_store.cpp.s:
+	$(MAKE) -f CMakeFiles/server.dir/build.make CMakeFiles/server.dir/src/db/mysql_user_store.cpp.s
+.PHONY : src/db/mysql_user_store.cpp.s
+
 src/http_request.o: src/http_request.cpp.o
 
 .PHONY : src/http_request.o
@@ -204,6 +231,33 @@ src/main.cpp.s:
 	$(MAKE) -f CMakeFiles/server.dir/build.make CMakeFiles/server.dir/src/main.cpp.s
 .PHONY : src/main.cpp.s
 
+src/security/password_hash.o: src/security/password_hash.cpp.o
+
+.PHONY : src/security/password_hash.o
+
+# target to build an object file
+src/security/password_hash.cpp.o:
+	$(MAKE) -f CMakeFiles/server.dir/build.make CMakeFiles/server.dir/src/security/password_hash.cpp.o
+.PHONY : src/security/password_hash.cpp.o
+
+src/security/password_hash.i: src/security/password_hash.cpp.i
+
+.PHONY : src/security/password_hash.i
+
+# target to preprocess a source file
+src/security/password_hash.cpp.i:
+	$(MAKE) -f CMakeFiles/server.dir/build.make CMakeFiles/server.dir/src/security/password_hash.cpp.i
+.PHONY : src/security/password_hash.cpp.i
+
+src/security/password_hash.s: src/security/password_hash.cpp.s
+
+.PHONY : src/security/password_hash.s
+
+# target to generate assembly for a file
+src/security/password_hash.cpp.s:
+	$(MAKE) -f CMakeFiles/server.dir/build.make CMakeFiles/server.dir/src/security/password_hash.cpp.s
+.PHONY : src/security/password_hash.cpp.s
+
 src/server.o: src/server.cpp.o
 
 .PHONY : src/server.o
@@ -267,6 +321,9 @@ help:
 	@echo "... rebuild_cache"
 	@echo "... edit_cache"
 	@echo "... server"
+	@echo "... src/db/mysql_user_store.o"
+	@echo "... src/db/mysql_user_store.i"
+	@echo "... src/db/mysql_user_store.s"
 	@echo "... src/http_request.o"
 	@echo "... src/http_request.i"
 	@echo "... src/http_request.s"
@@ -276,6 +333,9 @@ help:
 	@echo "... src/main.o"
 	@echo "... src/main.i"
 	@echo "... src/main.s"
+	@echo "... src/security/password_hash.o"
+	@echo "... src/security/password_hash.i"
+	@echo "... src/security/password_hash.s"
 	@echo "... src/server.o"
 	@echo "... src/server.i"
 	@echo "... src/server.s"

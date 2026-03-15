@@ -1,7 +1,9 @@
 file(REMOVE_RECURSE
+  "CMakeFiles/server.dir/src/db/mysql_user_store.cpp.o"
   "CMakeFiles/server.dir/src/http_request.cpp.o"
   "CMakeFiles/server.dir/src/logger.cpp.o"
   "CMakeFiles/server.dir/src/main.cpp.o"
+  "CMakeFiles/server.dir/src/security/password_hash.cpp.o"
   "CMakeFiles/server.dir/src/server.cpp.o"
   "CMakeFiles/server.dir/src/threadpool.cpp.o"
   "server"
