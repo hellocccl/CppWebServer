@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <netinet/tcp.h>
 #include <sstream>
 #include <string>
 #include <sys/epoll.h>
@@ -321,37 +322,13 @@ void Server::erase_conn_activity(int fd) {
 
 void Server::refresh_conn_timer(int fd) {
     std::lock_guard<std::mutex> lock(conn_mtx_);
-
-    TimerNode node;
-    node.fd = fd;
-    node.expires_at = std::chrono::steady_clock::now() + std::chrono::seconds(kConnectionTimeoutSeconds);
-    active_timers_[fd] = node.expires_at;
-    timer_heap_.push(node);
+    active_timers_[fd] =
+        std::chrono::steady_clock::now() + std::chrono::seconds(kConnectionTimeoutSeconds);
 }
 
 int Server::next_timeout_ms() {
-    std::lock_guard<std::mutex> lock(conn_mtx_);
-
-    while (!timer_heap_.empty()) {
-        const TimerNode& node = timer_heap_.top();
-        // 堆中可能残留同一 fd 的旧过期时间，和 active_timers_ 对不上时直接丢弃。
-        auto it = active_timers_.find(node.fd);
-        if (it == active_timers_.end() || it->second != node.expires_at) {
-            timer_heap_.pop();
-            continue;
-        }
-
-        auto now = std::chrono::steady_clock::now();
-        if (node.expires_at <= now) {
-            return 0;
-        }
-
-        return static_cast<int>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(node.expires_at - now).count()
-        );
-    }
-
-    return -1;
+    // 在高频 keep-alive 场景里，按请求维护小根堆的成本比定期扫一次连接表更高。
+    return 1000;
 }
 
 bool Server::add_conn_fd_to_epoll(int client_fd) {
@@ -805,6 +782,54 @@ bool Server::read_http_request(int client_fd, std::string& raw_request) {
     }
 }
 
+bool Server::try_read_fast_get_request(int client_fd, std::string& raw_request) {
+    raw_request.clear();
+
+    char peek_buf[4096];
+    int n = recv(client_fd, peek_buf, sizeof(peek_buf), MSG_PEEK);
+    if (n == 0) {
+        return false;
+    }
+    if (n < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+            return false;
+        }
+        return false;
+    }
+
+    std::string peeked(peek_buf, n);
+    size_t line_end = peeked.find("\r\n");
+    if (line_end == std::string::npos || line_end < 4 || peeked.compare(0, 4, "GET ") != 0) {
+        return false;
+    }
+
+    size_t header_end = peeked.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        return false;
+    }
+
+    size_t total = header_end + 4;
+    raw_request.resize(total);
+    size_t read_bytes = 0;
+    while (read_bytes < total) {
+        ssize_t chunk = recv(client_fd, &raw_request[read_bytes], total - read_bytes, 0);
+        if (chunk < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            raw_request.clear();
+            return false;
+        }
+        if (chunk == 0) {
+            raw_request.clear();
+            return false;
+        }
+        read_bytes += static_cast<size_t>(chunk);
+    }
+
+    return true;
+}
+
 bool Server::send_buffer(int client_fd, const std::string& buffer, size_t& sent_bytes) const {
     sent_bytes = 0;
     while (sent_bytes < buffer.size()) {
@@ -1138,20 +1163,22 @@ void Server::process_request_and_respond(int client_fd, const std::string& raw_r
 }
 
 void Server::handle_client_impl(int client_fd) {
-    // Reactor 模式：工作线程负责把请求从 socket 中读出来。
-    if (!set_blocking(client_fd)) {
-        Logger::instance().error("设置 client_fd 阻塞失败, fd = " + std::to_string(client_fd));
-        close(client_fd);
-        erase_conn_activity(client_fd);
-        return;
-    }
-
     std::string raw_request;
-    if (!read_http_request(client_fd, raw_request)) {
-        Logger::instance().error("读取请求失败或客户端已关闭连接, fd = " + std::to_string(client_fd));
-        close(client_fd);
-        erase_conn_activity(client_fd);
-        return;
+    if (!try_read_fast_get_request(client_fd, raw_request)) {
+        // Reactor 模式：通用路径下仍保持原有的阻塞读取逻辑。
+        if (!set_blocking(client_fd)) {
+            Logger::instance().error("设置 client_fd 阻塞失败, fd = " + std::to_string(client_fd));
+            close(client_fd);
+            erase_conn_activity(client_fd);
+            return;
+        }
+
+        if (!read_http_request(client_fd, raw_request)) {
+            Logger::instance().error("读取请求失败或客户端已关闭连接, fd = " + std::to_string(client_fd));
+            close(client_fd);
+            erase_conn_activity(client_fd);
+            return;
+        }
     }
 
     if (try_fast_handle_request(client_fd, raw_request)) {
@@ -1170,23 +1197,14 @@ void Server::check_timeout_connections() {
     {
         std::lock_guard<std::mutex> lock(conn_mtx_);
         auto now = std::chrono::steady_clock::now();
-
-        while (!timer_heap_.empty()) {
-            const TimerNode& node = timer_heap_.top();
-            // 懒删除：堆顶如果已经不是当前有效定时器，说明它是历史节点，直接弹出。
-            auto it = active_timers_.find(node.fd);
-            if (it == active_timers_.end() || it->second != node.expires_at) {
-                timer_heap_.pop();
-                continue;
+        for (std::unordered_map<int, std::chrono::steady_clock::time_point>::iterator it = active_timers_.begin();
+             it != active_timers_.end();) {
+            if (it->second <= now) {
+                expired_fds.push_back(it->first);
+                it = active_timers_.erase(it);
+            } else {
+                ++it;
             }
-
-            if (node.expires_at > now) {
-                break;
-            }
-
-            expired_fds.push_back(node.fd);
-            active_timers_.erase(it);
-            timer_heap_.pop();
         }
     }
 
@@ -1260,6 +1278,9 @@ void Server::run() {
                         continue;
                     }
 
+                    int nodelay = 1;
+                    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
                     if (!add_conn_fd_to_epoll(client_fd)) {
                         close(client_fd);
                         continue;
@@ -1304,19 +1325,21 @@ void Server::run() {
                     );
                 } else {
                     // 模拟 Proactor：主线程先完成读，再把“已读请求”交给线程池处理业务。
-                    if (!set_blocking(client_fd)) {
-                        Logger::instance().error("设置 client_fd 阻塞失败, fd = " + std::to_string(client_fd));
-                        close(client_fd);
-                        erase_conn_activity(client_fd);
-                        continue;
-                    }
-
                     std::string raw_request;
-                    if (!read_http_request(client_fd, raw_request)) {
-                        Logger::instance().error("主线程读取请求失败, fd = " + std::to_string(client_fd));
-                        close(client_fd);
-                        erase_conn_activity(client_fd);
-                        continue;
+                    if (!try_read_fast_get_request(client_fd, raw_request)) {
+                        if (!set_blocking(client_fd)) {
+                            Logger::instance().error("设置 client_fd 阻塞失败, fd = " + std::to_string(client_fd));
+                            close(client_fd);
+                            erase_conn_activity(client_fd);
+                            continue;
+                        }
+
+                        if (!read_http_request(client_fd, raw_request)) {
+                            Logger::instance().error("主线程读取请求失败, fd = " + std::to_string(client_fd));
+                            close(client_fd);
+                            erase_conn_activity(client_fd);
+                            continue;
+                        }
                     }
 
                     if (try_fast_handle_request(client_fd, raw_request)) {

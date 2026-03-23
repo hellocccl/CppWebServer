@@ -62,6 +62,7 @@ private:
     bool read_file(const std::string& filename, std::string& content);
     std::shared_ptr<const StaticFileCacheEntry> get_static_file(const std::string& file_path);
     bool read_http_request(int client_fd, std::string& raw_request);
+    bool try_read_fast_get_request(int client_fd, std::string& raw_request);
     bool resolve_static_path(const std::string& url_path, std::string& file_path) const;
     std::string content_type_from_path(const std::string& file_path) const;
     bool try_fast_handle_request(int client_fd, const std::string& raw_request);
