@@ -1,6 +1,5 @@
 #include "http_request.h"
 
-#include <sstream>
 #include <algorithm>
 #include <cctype>
 
@@ -26,6 +25,9 @@ std::string to_lower(std::string s) {
 } // namespace
 
 bool HttpRequest::parse(const std::string& raw_request) {
+    method_.clear();
+    path_.clear();
+    version_.clear();
     headers_.clear();
     body_.clear();
 
@@ -34,9 +36,19 @@ bool HttpRequest::parse(const std::string& raw_request) {
         return false;
     }
 
-    std::string request_line = raw_request.substr(0, line_end);
-    std::stringstream ss(request_line);
-    ss >> method_ >> path_ >> version_;
+    size_t method_end = raw_request.find(' ');
+    if (method_end == std::string::npos || method_end >= line_end) {
+        return false;
+    }
+
+    size_t path_end = raw_request.find(' ', method_end + 1);
+    if (path_end == std::string::npos || path_end >= line_end) {
+        return false;
+    }
+
+    method_ = raw_request.substr(0, method_end);
+    path_ = raw_request.substr(method_end + 1, path_end - method_end - 1);
+    version_ = raw_request.substr(path_end + 1, line_end - path_end - 1);
     if (method_.empty() || path_.empty() || version_.empty()) {
         return false;
     }
@@ -46,24 +58,26 @@ bool HttpRequest::parse(const std::string& raw_request) {
         return false;
     }
 
-    size_t headers_start = line_end + 2;
-    std::string headers_block = raw_request.substr(headers_start, header_end - headers_start);
-    std::istringstream hs(headers_block);
-    std::string line;
-    while (std::getline(hs, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
+    size_t cursor = line_end + 2;
+    while (cursor < header_end) {
+        size_t next = raw_request.find("\r\n", cursor);
+        if (next == std::string::npos || next > header_end) {
+            next = header_end;
         }
-        if (line.empty()) {
+
+        if (next == cursor) {
+            cursor += 2;
             continue;
         }
-        size_t colon = line.find(':');
-        if (colon == std::string::npos) {
-            continue;
+
+        size_t colon = raw_request.find(':', cursor);
+        if (colon != std::string::npos && colon < next) {
+            std::string key = to_lower(trim(raw_request.substr(cursor, colon - cursor)));
+            std::string value = trim(raw_request.substr(colon + 1, next - colon - 1));
+            headers_[key] = value;
         }
-        std::string key = to_lower(trim(line.substr(0, colon)));
-        std::string value = trim(line.substr(colon + 1));
-        headers_[key] = value;
+
+        cursor = next + 2;
     }
 
     body_ = raw_request.substr(header_end + 4);

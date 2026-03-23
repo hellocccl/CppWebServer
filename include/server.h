@@ -25,6 +25,8 @@ private:
     struct StaticFileCacheEntry {
         std::string body;
         std::string content_type;
+        std::string keep_alive_response;
+        std::string close_response;
     };
 
     // 反应堆模型：
@@ -62,10 +64,12 @@ private:
     bool read_http_request(int client_fd, std::string& raw_request);
     bool resolve_static_path(const std::string& url_path, std::string& file_path) const;
     std::string content_type_from_path(const std::string& file_path) const;
+    bool try_fast_handle_request(int client_fd, const std::string& raw_request);
     bool init_database();
     bool register_user(const std::string& username, const std::string& password, std::string& error_message);
     bool verify_user(const std::string& username, const std::string& password, std::string& error_message);
     void process_request_and_respond(int client_fd, const std::string& raw_request);
+    bool send_buffer(int client_fd, const std::string& buffer, size_t& sent_bytes) const;
     bool send_response_parts(int client_fd, const std::string& headers, const std::string& body, size_t& sent_bytes) const;
     uint32_t listen_epoll_events() const;
     uint32_t conn_epoll_events() const;

@@ -28,6 +28,7 @@ const char* kDbUser = "root";
 const char* kDbPassword = "123456789";
 const char* kDbName = "mydb";
 const size_t kMaxCachedFileBytes = 1024 * 1024;
+const size_t kMaxPrebuiltResponseBytes = 128 * 1024;
 
 std::string to_lower_copy(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -48,6 +49,118 @@ std::string strip_query_and_fragment(std::string path) {
     }
 
     return path;
+}
+
+std::string trim_ascii(const std::string& s) {
+    size_t start = 0;
+    while (start < s.size() && (s[start] == ' ' || s[start] == '\t')) {
+        ++start;
+    }
+
+    size_t end = s.size();
+    while (end > start && (s[end - 1] == ' ' || s[end - 1] == '\t')) {
+        --end;
+    }
+
+    return s.substr(start, end - start);
+}
+
+bool equals_ignore_ascii_case(const std::string& lhs, const char* rhs) {
+    size_t rhs_len = std::strlen(rhs);
+    if (lhs.size() != rhs_len) {
+        return false;
+    }
+
+    for (size_t i = 0; i < rhs_len; ++i) {
+        if (std::tolower(static_cast<unsigned char>(lhs[i])) !=
+            std::tolower(static_cast<unsigned char>(rhs[i]))) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+std::string build_response_buffer(
+    const std::string& status_line,
+    const std::string& content_type,
+    const std::string& body,
+    bool keep_alive
+) {
+    std::string response;
+    response.reserve(status_line.size() + content_type.size() + body.size() + 96);
+    response += status_line;
+    response += "Content-Type: " + content_type + "\r\n";
+    response += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+    response += "Connection: ";
+    response += keep_alive ? "keep-alive\r\n" : "close\r\n";
+    response += "\r\n";
+    response += body;
+    return response;
+}
+
+struct FastRequestMeta {
+    std::string path;
+    bool keep_alive;
+};
+
+bool parse_fast_static_request(const std::string& raw_request, FastRequestMeta& meta) {
+    size_t line_end = raw_request.find("\r\n");
+    if (line_end == std::string::npos) {
+        return false;
+    }
+
+    size_t method_end = raw_request.find(' ');
+    if (method_end == std::string::npos || method_end >= line_end || method_end != 3 ||
+        raw_request.compare(0, 3, "GET") != 0) {
+        return false;
+    }
+
+    size_t path_end = raw_request.find(' ', method_end + 1);
+    if (path_end == std::string::npos || path_end >= line_end) {
+        return false;
+    }
+
+    meta.path = raw_request.substr(method_end + 1, path_end - method_end - 1);
+    std::string version = raw_request.substr(path_end + 1, line_end - path_end - 1);
+    bool is_http11 = (version == "HTTP/1.1");
+    bool is_http10 = (version == "HTTP/1.0");
+    if (!is_http11 && !is_http10) {
+        return false;
+    }
+
+    size_t header_end = raw_request.find("\r\n\r\n", line_end + 2);
+    if (header_end == std::string::npos) {
+        return false;
+    }
+
+    bool connection_close = false;
+    bool connection_keep_alive = false;
+    size_t cursor = line_end + 2;
+    while (cursor < header_end) {
+        size_t next = raw_request.find("\r\n", cursor);
+        if (next == std::string::npos || next > header_end) {
+            next = header_end;
+        }
+
+        size_t colon = raw_request.find(':', cursor);
+        if (colon != std::string::npos && colon < next) {
+            std::string key = trim_ascii(raw_request.substr(cursor, colon - cursor));
+            if (equals_ignore_ascii_case(key, "Connection")) {
+                std::string value = to_lower_copy(trim_ascii(raw_request.substr(colon + 1, next - colon - 1)));
+                if (value == "close") {
+                    connection_close = true;
+                } else if (value == "keep-alive") {
+                    connection_keep_alive = true;
+                }
+            }
+        }
+
+        cursor = next + 2;
+    }
+
+    meta.keep_alive = is_http11 ? !connection_close : connection_keep_alive;
+    return true;
 }
 
 int hex_value(char c) {
@@ -405,6 +518,20 @@ std::shared_ptr<const Server::StaticFileCacheEntry> Server::get_static_file(cons
     std::shared_ptr<StaticFileCacheEntry> entry(new StaticFileCacheEntry());
     entry->body.swap(content);
     entry->content_type = content_type_from_path(file_path);
+    if (entry->body.size() <= kMaxPrebuiltResponseBytes) {
+        entry->keep_alive_response = build_response_buffer(
+            "HTTP/1.1 200 OK\r\n",
+            entry->content_type,
+            entry->body,
+            true
+        );
+        entry->close_response = build_response_buffer(
+            "HTTP/1.1 200 OK\r\n",
+            entry->content_type,
+            entry->body,
+            false
+        );
+    }
 
     if (entry->body.size() <= kMaxCachedFileBytes) {
         std::lock_guard<std::mutex> lock(static_file_cache_mtx_);
@@ -678,6 +805,86 @@ bool Server::read_http_request(int client_fd, std::string& raw_request) {
     }
 }
 
+bool Server::send_buffer(int client_fd, const std::string& buffer, size_t& sent_bytes) const {
+    sent_bytes = 0;
+    while (sent_bytes < buffer.size()) {
+        ssize_t n = send(client_fd, buffer.data() + sent_bytes, buffer.size() - sent_bytes, 0);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (n == 0) {
+            return false;
+        }
+
+        sent_bytes += static_cast<size_t>(n);
+    }
+
+    return true;
+}
+
+bool Server::try_fast_handle_request(int client_fd, const std::string& raw_request) {
+    FastRequestMeta meta;
+    if (!parse_fast_static_request(raw_request, meta)) {
+        return false;
+    }
+
+    std::string file_path;
+    if (!resolve_static_path(meta.path, file_path)) {
+        return false;
+    }
+
+    std::shared_ptr<const StaticFileCacheEntry> static_file = get_static_file(file_path);
+    if (!static_file) {
+        return false;
+    }
+
+    const std::string& response =
+        meta.keep_alive ? static_file->keep_alive_response : static_file->close_response;
+    if (response.empty()) {
+        return false;
+    }
+
+    size_t sent = 0;
+    bool send_ok = send_buffer(client_fd, response, sent);
+    if (!send_ok) {
+        Logger::instance().error(
+            "快速路径 send 失败, fd = " + std::to_string(client_fd) +
+            ", errno = " + std::to_string(errno) +
+            ", error = " + std::string(strerror(errno))
+        );
+    } else {
+        Logger::instance().debug(
+            "快速路径响应成功, fd = " + std::to_string(client_fd) +
+            ", bytes = " + std::to_string(sent)
+        );
+    }
+
+    if (send_ok && meta.keep_alive && sent > 0) {
+        if (!set_nonblocking(client_fd)) {
+            Logger::instance().error("快速路径设置 client_fd 非阻塞失败, fd = " + std::to_string(client_fd));
+            close(client_fd);
+            erase_conn_activity(client_fd);
+            return true;
+        }
+
+        if (!add_conn_fd_to_epoll(client_fd)) {
+            close(client_fd);
+            erase_conn_activity(client_fd);
+            return true;
+        }
+
+        refresh_conn_timer(client_fd);
+        return true;
+    }
+
+    close(client_fd);
+    erase_conn_activity(client_fd);
+    return true;
+}
+
 bool Server::send_response_parts(
     int client_fd,
     const std::string& headers,
@@ -872,13 +1079,35 @@ void Server::process_request_and_respond(int client_fd, const std::string& raw_r
     response_headers += "\r\n";
 
     size_t sent = 0;
-    if (!send_response_parts(client_fd, response_headers, *response_body, sent)) {
-        Logger::instance().error(
-            "send 失败, fd = " + std::to_string(client_fd) +
-            ", errno = " + std::to_string(errno) +
-            ", error = " + std::string(strerror(errno))
-        );
+    bool can_use_prebuilt_response =
+        request.method() == "GET" &&
+        status_text == "200 OK" &&
+        static_file &&
+        !(keep_alive ? static_file->keep_alive_response.empty() : static_file->close_response.empty());
+    bool send_ok = false;
+    if (can_use_prebuilt_response) {
+        const std::string& response =
+            keep_alive ? static_file->keep_alive_response : static_file->close_response;
+        send_ok = send_buffer(client_fd, response, sent);
+        if (!send_ok) {
+            Logger::instance().error(
+                "send 失败, fd = " + std::to_string(client_fd) +
+                ", errno = " + std::to_string(errno) +
+                ", error = " + std::string(strerror(errno))
+            );
+        }
     } else {
+        send_ok = send_response_parts(client_fd, response_headers, *response_body, sent);
+        if (!send_ok) {
+            Logger::instance().error(
+                "send 失败, fd = " + std::to_string(client_fd) +
+                ", errno = " + std::to_string(errno) +
+                ", error = " + std::string(strerror(errno))
+            );
+        }
+    }
+
+    if (send_ok) {
         Logger::instance().debug(
             "响应发送成功, fd = " + std::to_string(client_fd) +
             ", status = " + status_text +
@@ -886,7 +1115,7 @@ void Server::process_request_and_respond(int client_fd, const std::string& raw_r
         );
     }
 
-    if (keep_alive && sent > 0) {
+    if (send_ok && keep_alive && sent > 0) {
         if (!set_nonblocking(client_fd)) {
             Logger::instance().error("设置 client_fd 非阻塞失败, fd = " + std::to_string(client_fd));
             close(client_fd);
@@ -922,6 +1151,10 @@ void Server::handle_client_impl(int client_fd) {
         Logger::instance().error("读取请求失败或客户端已关闭连接, fd = " + std::to_string(client_fd));
         close(client_fd);
         erase_conn_activity(client_fd);
+        return;
+    }
+
+    if (try_fast_handle_request(client_fd, raw_request)) {
         return;
     }
 
@@ -1083,6 +1316,10 @@ void Server::run() {
                         Logger::instance().error("主线程读取请求失败, fd = " + std::to_string(client_fd));
                         close(client_fd);
                         erase_conn_activity(client_fd);
+                        continue;
+                    }
+
+                    if (try_fast_handle_request(client_fd, raw_request)) {
                         continue;
                     }
 
