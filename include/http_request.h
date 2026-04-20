@@ -13,6 +13,14 @@ private:
     std::string body_;
 
 public:
+    enum ParseState {
+        kInvalid,
+        kIncomplete,
+        kComplete
+    };
+
+    static ParseState parse_request_size(const std::string& raw_buffer, size_t& request_size);
+
     // 解析原始请求报文
     bool parse(const std::string& raw_request);
 

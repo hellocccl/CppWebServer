@@ -37,13 +37,16 @@
   - `2`：listenfd = ET, connfd = LT
   - `3`：listenfd = ET, connfd = ET
 
-### 8) 定时器改为小根堆实现
-- 空闲连接超时不再使用“遍历整个连接表”的线性扫描。
-- 当前实现改为“小根堆 + 懒删除”：
-  - 堆顶永远是最早过期的连接。
-  - `epoll_wait` 的超时时间会动态取“下一个即将过期的连接”。
-  - 连接进入线程池处理时，会先从空闲定时器里移除；只有 keep-alive 重新挂回 epoll 时，才重新入堆。
-- 这样相比原先的 `unordered_map + 全量扫描`，空闲超时检查从每轮 `O(n)` 优化为按到期连接处理，刷新定时器为 `O(log n)`。
+### 8) 定时器当前实现（连接空闲超时）
+- 当前定时器负责管理 keep-alive 空闲连接，默认空闲 30 秒后关闭。
+- 当前真正生效的实现是 `unordered_map<int, time_point> + 每秒扫描一次`：
+  - `active_timers_` 记录每个空闲连接的过期时刻。
+  - 新连接接入后会登记过期时间。
+  - 连接进入读/处理阶段前，会先从 `active_timers_` 中移除。
+  - 响应发送成功且继续 keep-alive 时，会重新登记新的过期时间。
+  - 主循环中 `epoll_wait` 最长阻塞 1000ms，醒来后调用 `check_timeout_connections()` 扫描超时 fd。
+- 头文件中仍保留了小根堆相关结构声明，但当前版本尚未真正切换到“小根堆 + 懒删除”实现。
+- 详细说明见：[定时器模块详解](./定时器模块详解.md)。
 
 ## MySQL 配置
 当前代码固定使用以下配置（位于 `src/server.cpp` 顶部常量）：
@@ -221,7 +224,7 @@ http://127.0.0.1:8080/xxx.mp4
 - `include/server.h`
   - 新增数据库初始化、注册/登录校验、静态路径解析、MIME 判断等函数声明。
   - 新增并发模型与触发模式字段及辅助函数声明。
-  - 新增基于小根堆的连接定时器数据结构与辅助函数声明。
+  - 新增连接空闲超时管理相关数据结构与辅助函数声明（当前实际生效的是 `active_timers_` 扫描方案，同时保留了小根堆结构声明）。
 - `src/server.cpp`
   - 接入 MySQL C API。
   - 新增 `/register`、`/login` 路由。
@@ -230,8 +233,8 @@ http://127.0.0.1:8080/xxx.mp4
   - 增加 `.mp4 -> video/mp4` 的 MIME 映射。
   - 新增 `listenfd/connfd` 的 LT/ET 事件注册逻辑。
   - 新增 Reactor / 模拟Proactor 两套事件处理分支。
-  - 定时器由线性扫描改为“小根堆 + 懒删除”。
-  - `epoll_wait` 超时时间改为由最近过期连接动态驱动。
+  - 新增连接空闲超时回收逻辑：基于 `active_timers_` 记录过期时间，并在主循环中周期性扫描关闭超时连接。
+  - `next_timeout_ms()` 当前为固定 1000ms，尚未改为“由最近过期连接动态驱动”。
   - 注册时改为写入 `password_hash`，登录时改为哈希校验。
 - `include/security/password_hash.h`、`src/security/password_hash.cpp`
   - 新增密码哈希与校验模块。

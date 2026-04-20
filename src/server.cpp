@@ -12,8 +12,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <functional>
 #include <netinet/tcp.h>
-#include <sstream>
 #include <string>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -30,6 +30,7 @@ const char* kDbPassword = "123456789";
 const char* kDbName = "mydb";
 const size_t kMaxCachedFileBytes = 1024 * 1024;
 const size_t kMaxPrebuiltResponseBytes = 128 * 1024;
+const size_t kMaxBufferedRequestBytes = 1024 * 1024;
 
 std::string to_lower_copy(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -52,36 +53,6 @@ std::string strip_query_and_fragment(std::string path) {
     return path;
 }
 
-std::string trim_ascii(const std::string& s) {
-    size_t start = 0;
-    while (start < s.size() && (s[start] == ' ' || s[start] == '\t')) {
-        ++start;
-    }
-
-    size_t end = s.size();
-    while (end > start && (s[end - 1] == ' ' || s[end - 1] == '\t')) {
-        --end;
-    }
-
-    return s.substr(start, end - start);
-}
-
-bool equals_ignore_ascii_case(const std::string& lhs, const char* rhs) {
-    size_t rhs_len = std::strlen(rhs);
-    if (lhs.size() != rhs_len) {
-        return false;
-    }
-
-    for (size_t i = 0; i < rhs_len; ++i) {
-        if (std::tolower(static_cast<unsigned char>(lhs[i])) !=
-            std::tolower(static_cast<unsigned char>(rhs[i]))) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
 std::string build_response_buffer(
     const std::string& status_line,
     const std::string& content_type,
@@ -98,70 +69,6 @@ std::string build_response_buffer(
     response += "\r\n";
     response += body;
     return response;
-}
-
-struct FastRequestMeta {
-    std::string path;
-    bool keep_alive;
-};
-
-bool parse_fast_static_request(const std::string& raw_request, FastRequestMeta& meta) {
-    size_t line_end = raw_request.find("\r\n");
-    if (line_end == std::string::npos) {
-        return false;
-    }
-
-    size_t method_end = raw_request.find(' ');
-    if (method_end == std::string::npos || method_end >= line_end || method_end != 3 ||
-        raw_request.compare(0, 3, "GET") != 0) {
-        return false;
-    }
-
-    size_t path_end = raw_request.find(' ', method_end + 1);
-    if (path_end == std::string::npos || path_end >= line_end) {
-        return false;
-    }
-
-    meta.path = raw_request.substr(method_end + 1, path_end - method_end - 1);
-    std::string version = raw_request.substr(path_end + 1, line_end - path_end - 1);
-    bool is_http11 = (version == "HTTP/1.1");
-    bool is_http10 = (version == "HTTP/1.0");
-    if (!is_http11 && !is_http10) {
-        return false;
-    }
-
-    size_t header_end = raw_request.find("\r\n\r\n", line_end + 2);
-    if (header_end == std::string::npos) {
-        return false;
-    }
-
-    bool connection_close = false;
-    bool connection_keep_alive = false;
-    size_t cursor = line_end + 2;
-    while (cursor < header_end) {
-        size_t next = raw_request.find("\r\n", cursor);
-        if (next == std::string::npos || next > header_end) {
-            next = header_end;
-        }
-
-        size_t colon = raw_request.find(':', cursor);
-        if (colon != std::string::npos && colon < next) {
-            std::string key = trim_ascii(raw_request.substr(cursor, colon - cursor));
-            if (equals_ignore_ascii_case(key, "Connection")) {
-                std::string value = to_lower_copy(trim_ascii(raw_request.substr(colon + 1, next - colon - 1)));
-                if (value == "close") {
-                    connection_close = true;
-                } else if (value == "keep-alive") {
-                    connection_keep_alive = true;
-                }
-            }
-        }
-
-        cursor = next + 2;
-    }
-
-    meta.keep_alive = is_http11 ? !connection_close : connection_keep_alive;
-    return true;
 }
 
 int hex_value(char c) {
@@ -271,6 +178,296 @@ std::string escape_mysql_string(MYSQL* conn, const std::string& raw) {
 
 } // namespace
 
+class Server::RequestHandler {
+public:
+    virtual ~RequestHandler() {}
+
+    virtual HandlerResponse handle(
+        Server& server,
+        const HttpRequest& request,
+        const std::string& request_path
+    ) const = 0;
+
+protected:
+    static HandlerResponse make_html_response(
+        const std::string& status_line,
+        const std::string& status_text,
+        const std::string& title,
+        const std::string& message
+    ) {
+        HandlerResponse response;
+        response.status_line = status_line;
+        response.status_text = status_text;
+        response.body = build_html_message(title, message);
+        return response;
+    }
+
+    static HandlerResponse make_not_found_response(Server& server) {
+        HandlerResponse response;
+        response.status_line = "HTTP/1.1 404 Not Found\r\n";
+        response.status_text = "404 Not Found";
+
+        std::string file_path = server.www_root_ + "/404.html";
+        std::shared_ptr<const Server::StaticFileCacheEntry> static_file = server.get_static_file(file_path);
+        if (static_file) {
+            response.content_type = static_file->content_type;
+            response.static_file = static_file;
+            return response;
+        }
+
+        response.status_line = "HTTP/1.1 500 Internal Server Error\r\n";
+        response.status_text = "500 Internal Server Error";
+        response.body = build_html_message("500 Internal Server Error", "服务器读取页面文件失败");
+        return response;
+    }
+};
+
+class Server::StaticGetHandler : public Server::RequestHandler {
+public:
+    HandlerResponse handle(
+        Server& server,
+        const HttpRequest& request,
+        const std::string& request_path
+    ) const override {
+        (void)request;
+
+        std::string file_path;
+        if (!server.resolve_static_path(request_path, file_path)) {
+            return make_html_response(
+                "HTTP/1.1 400 Bad Request\r\n",
+                "400 Bad Request",
+                "400 Bad Request",
+                "非法路径"
+            );
+        }
+
+        std::shared_ptr<const Server::StaticFileCacheEntry> static_file = server.get_static_file(file_path);
+        if (!static_file) {
+            return make_not_found_response(server);
+        }
+
+        HandlerResponse response;
+        response.status_line = "HTTP/1.1 200 OK\r\n";
+        response.status_text = "200 OK";
+        response.content_type = static_file->content_type;
+        response.static_file = static_file;
+        return response;
+    }
+};
+
+class Server::PostEchoHandler : public Server::RequestHandler {
+public:
+    HandlerResponse handle(
+        Server& server,
+        const HttpRequest& request,
+        const std::string& request_path
+    ) const override {
+        (void)server;
+        (void)request_path;
+
+        HandlerResponse response;
+        response.status_line = "HTTP/1.1 200 OK\r\n";
+        response.status_text = "200 OK";
+        response.content_type = "text/plain; charset=UTF-8";
+        response.body = "POST OK\n";
+        response.body += request.body();
+        return response;
+    }
+};
+
+class Server::RegisterHandler : public Server::RequestHandler {
+public:
+    HandlerResponse handle(
+        Server& server,
+        const HttpRequest& request,
+        const std::string& request_path
+    ) const override {
+        (void)request_path;
+
+        std::unordered_map<std::string, std::string> form = parse_form_urlencoded(request.body());
+        std::string username = form["username"];
+        std::string password = form["password"];
+
+        if (username.empty() || password.empty()) {
+            return make_html_response(
+                "HTTP/1.1 400 Bad Request\r\n",
+                "400 Bad Request",
+                "注册失败",
+                "username 或 password 不能为空"
+            );
+        }
+
+        std::string error_message;
+        if (server.register_user(username, password, error_message)) {
+            return make_html_response(
+                "HTTP/1.1 200 OK\r\n",
+                "200 OK",
+                "注册成功",
+                "用户已写入 MySQL，可继续登录。"
+            );
+        }
+        if (error_message == "用户名已存在") {
+            return make_html_response(
+                "HTTP/1.1 409 Conflict\r\n",
+                "409 Conflict",
+                "注册失败",
+                error_message
+            );
+        }
+
+        return make_html_response(
+            "HTTP/1.1 500 Internal Server Error\r\n",
+            "500 Internal Server Error",
+            "注册失败",
+            error_message
+        );
+    }
+};
+
+class Server::LoginHandler : public Server::RequestHandler {
+public:
+    HandlerResponse handle(
+        Server& server,
+        const HttpRequest& request,
+        const std::string& request_path
+    ) const override {
+        (void)request_path;
+
+        std::unordered_map<std::string, std::string> form = parse_form_urlencoded(request.body());
+        std::string username = form["username"];
+        std::string password = form["password"];
+
+        if (username.empty() || password.empty()) {
+            return make_html_response(
+                "HTTP/1.1 400 Bad Request\r\n",
+                "400 Bad Request",
+                "登录失败",
+                "username 或 password 不能为空"
+            );
+        }
+
+        std::string error_message;
+        if (server.verify_user(username, password, error_message)) {
+            return make_html_response(
+                "HTTP/1.1 200 OK\r\n",
+                "200 OK",
+                "登录成功",
+                "用户名和密码校验通过。"
+            );
+        }
+        if (error_message == "用户不存在" || error_message == "密码错误") {
+            return make_html_response(
+                "HTTP/1.1 401 Unauthorized\r\n",
+                "401 Unauthorized",
+                "登录失败",
+                error_message
+            );
+        }
+
+        return make_html_response(
+            "HTTP/1.1 500 Internal Server Error\r\n",
+            "500 Internal Server Error",
+            "登录失败",
+            error_message
+        );
+    }
+};
+
+class Server::NotFoundHandler : public Server::RequestHandler {
+public:
+    HandlerResponse handle(
+        Server& server,
+        const HttpRequest& request,
+        const std::string& request_path
+    ) const override {
+        (void)request;
+        (void)request_path;
+        return make_not_found_response(server);
+    }
+};
+
+class Server::MethodNotAllowedHandler : public Server::RequestHandler {
+public:
+    HandlerResponse handle(
+        Server& server,
+        const HttpRequest& request,
+        const std::string& request_path
+    ) const override {
+        (void)server;
+        (void)request;
+        (void)request_path;
+
+        HandlerResponse response;
+        response.status_line = "HTTP/1.1 405 Method Not Allowed\r\n";
+        response.status_text = "405 Method Not Allowed";
+        response.content_type = "text/plain; charset=UTF-8";
+        response.body = "Method Not Allowed";
+        return response;
+    }
+};
+
+class Server::RequestHandlerFactory {
+public:
+    typedef std::function<std::unique_ptr<RequestHandler>()> Creator;
+
+    RequestHandlerFactory() {
+        register_method_handler("GET", []() {
+            return std::unique_ptr<RequestHandler>(new StaticGetHandler());
+        });
+        register_route("POST", "/post", []() {
+            return std::unique_ptr<RequestHandler>(new PostEchoHandler());
+        });
+        register_route("POST", "/register", []() {
+            return std::unique_ptr<RequestHandler>(new RegisterHandler());
+        });
+        register_route("POST", "/login", []() {
+            return std::unique_ptr<RequestHandler>(new LoginHandler());
+        });
+        register_method_handler("POST", []() {
+            return std::unique_ptr<RequestHandler>(new NotFoundHandler());
+        });
+        default_creator_ = []() {
+            return std::unique_ptr<RequestHandler>(new MethodNotAllowedHandler());
+        };
+    }
+
+    std::unique_ptr<RequestHandler> create(
+        const HttpRequest& request,
+        const std::string& request_path
+    ) const {
+        std::unordered_map<std::string, Creator>::const_iterator route_it =
+            route_creators_.find(route_key(request.method(), request_path));
+        if (route_it != route_creators_.end()) {
+            return route_it->second();
+        }
+
+        std::unordered_map<std::string, Creator>::const_iterator method_it =
+            method_creators_.find(request.method());
+        if (method_it != method_creators_.end()) {
+            return method_it->second();
+        }
+
+        return default_creator_();
+    }
+
+private:
+    std::unordered_map<std::string, Creator> route_creators_;
+    std::unordered_map<std::string, Creator> method_creators_;
+    Creator default_creator_;
+
+    static std::string route_key(const std::string& method, const std::string& path) {
+        return method + " " + path;
+    }
+
+    void register_route(const std::string& method, const std::string& path, const Creator& creator) {
+        route_creators_[route_key(method, path)] = creator;
+    }
+
+    void register_method_handler(const std::string& method, const Creator& creator) {
+        method_creators_[method] = creator;
+    }
+};
+
 const int Server::kConnectionTimeoutSeconds;
 
 Server::Server(int port, int thread_count, const std::string& www_root, int actor_model, int trig_mode)
@@ -281,6 +478,7 @@ Server::Server(int port, int thread_count, const std::string& www_root, int acto
       server_fd_(-1),
       epfd_(-1),
       pool_(thread_count),
+      handler_factory_(new RequestHandlerFactory()),
       www_root_(www_root) {
     // trig_mode 编码：
     // 0 -> LT + LT
@@ -308,7 +506,7 @@ uint32_t Server::listen_epoll_events() const {
 }
 
 uint32_t Server::conn_epoll_events() const {
-    uint32_t events = EPOLLIN;
+    uint32_t events = EPOLLIN | EPOLLONESHOT;
     if (conn_trig_mode_ == 1) {
         events |= EPOLLET;
     }
@@ -318,6 +516,17 @@ uint32_t Server::conn_epoll_events() const {
 void Server::erase_conn_activity(int fd) {
     std::lock_guard<std::mutex> lock(conn_mtx_);
     active_timers_.erase(fd);
+}
+
+void Server::erase_conn_buffer(int fd) {
+    std::lock_guard<std::mutex> lock(conn_mtx_);
+    conn_read_buffers_.erase(fd);
+}
+
+void Server::close_client_connection(int fd) {
+    close(fd);
+    erase_conn_activity(fd);
+    erase_conn_buffer(fd);
 }
 
 void Server::refresh_conn_timer(int fd) {
@@ -345,6 +554,20 @@ bool Server::add_conn_fd_to_epoll(int client_fd) {
     return true;
 }
 
+bool Server::rearm_conn_fd_in_epoll(int client_fd) {
+    epoll_event client_ev;
+    client_ev.events = conn_epoll_events();
+    client_ev.data.fd = client_fd;
+    if (epoll_ctl(epfd_, EPOLL_CTL_MOD, client_fd, &client_ev) == -1) {
+        Logger::instance().error(
+            "epoll_ctl MOD client_fd 失败, fd = " + std::to_string(client_fd) +
+            ", error = " + std::string(strerror(errno))
+        );
+        return false;
+    }
+    return true;
+}
+
 bool Server::set_nonblocking(int fd) {
     int old_flags = fcntl(fd, F_GETFL, 0);
     if (old_flags == -1) {
@@ -352,19 +575,6 @@ bool Server::set_nonblocking(int fd) {
     }
 
     if (fcntl(fd, F_SETFL, old_flags | O_NONBLOCK) == -1) {
-        return false;
-    }
-
-    return true;
-}
-
-bool Server::set_blocking(int fd) {
-    int old_flags = fcntl(fd, F_GETFL, 0);
-    if (old_flags == -1) {
-        return false;
-    }
-
-    if (fcntl(fd, F_SETFL, old_flags & ~O_NONBLOCK) == -1) {
         return false;
     }
 
@@ -725,109 +935,103 @@ bool Server::verify_user(const std::string& username, const std::string& passwor
     return true;
 }
 
-bool Server::read_http_request(int client_fd, std::string& raw_request) {
-    const size_t MAX_REQUEST_SIZE = 1024 * 1024; // 1MB 上限
+Server::ReadHttpRequestResult Server::pop_buffered_http_request(int client_fd, std::string& raw_request) {
     raw_request.clear();
 
-    size_t header_end = std::string::npos;
-    size_t expected_total = 0;
-
-    while (true) {
-        char buf[1024] = {0};
-        int n = recv(client_fd, buf, sizeof(buf), 0);
-        if (n == 0) {
-            return false;
-        }
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return false;
-        }
-
-        raw_request.append(buf, n);
-        if (raw_request.size() > MAX_REQUEST_SIZE) {
-            Logger::instance().error("请求过大，超过上限");
-            return false;
-        }
-
-        if (header_end == std::string::npos) {
-            header_end = raw_request.find("\r\n\r\n");
-            if (header_end != std::string::npos) {
-                expected_total = header_end + 4;
-                std::string headers = raw_request.substr(0, header_end);
-                std::string headers_lower = headers;
-                for (char& c : headers_lower) {
-                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                }
-                size_t pos = headers_lower.find("content-length:");
-                if (pos != std::string::npos) {
-                    size_t line_end = headers_lower.find("\r\n", pos);
-                    std::string line = headers_lower.substr(pos, line_end - pos);
-                    size_t colon = line.find(':');
-                    if (colon != std::string::npos) {
-                        std::string value = line.substr(colon + 1);
-                        std::stringstream ss(value);
-                        size_t len = 0;
-                        ss >> len;
-                        expected_total += len;
-                    }
-                }
-            }
-        }
-
-        if (header_end != std::string::npos && raw_request.size() >= expected_total) {
-            return true;
-        }
+    std::lock_guard<std::mutex> lock(conn_mtx_);
+    std::unordered_map<int, std::string>::iterator it = conn_read_buffers_.find(client_fd);
+    if (it == conn_read_buffers_.end() || it->second.empty()) {
+        return kReadHttpRequestIncomplete;
     }
+
+    size_t request_size = 0;
+    HttpRequest::ParseState parse_state = HttpRequest::parse_request_size(it->second, request_size);
+    if (parse_state == HttpRequest::kInvalid) {
+        return kReadHttpRequestError;
+    }
+    if (parse_state == HttpRequest::kIncomplete) {
+        return kReadHttpRequestIncomplete;
+    }
+
+    raw_request = it->second.substr(0, request_size);
+    it->second.erase(0, request_size);
+    if (it->second.empty()) {
+        conn_read_buffers_.erase(it);
+    }
+
+    return kReadHttpRequestReady;
 }
 
-bool Server::try_read_fast_get_request(int client_fd, std::string& raw_request) {
-    raw_request.clear();
+Server::ReadHttpRequestResult Server::read_http_request(
+    int client_fd,
+    std::string& raw_request,
+    bool& peer_closed
+) {
+    peer_closed = false;
 
-    char peek_buf[4096];
-    int n = recv(client_fd, peek_buf, sizeof(peek_buf), MSG_PEEK);
-    if (n == 0) {
-        return false;
-    }
-    if (n < 0) {
-        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-            return false;
-        }
-        return false;
+    ReadHttpRequestResult buffered_result = pop_buffered_http_request(client_fd, raw_request);
+    if (buffered_result != kReadHttpRequestIncomplete) {
+        return buffered_result;
     }
 
-    std::string peeked(peek_buf, n);
-    size_t line_end = peeked.find("\r\n");
-    if (line_end == std::string::npos || line_end < 4 || peeked.compare(0, 4, "GET ") != 0) {
-        return false;
-    }
-
-    size_t header_end = peeked.find("\r\n\r\n");
-    if (header_end == std::string::npos) {
-        return false;
-    }
-
-    size_t total = header_end + 4;
-    raw_request.resize(total);
-    size_t read_bytes = 0;
-    while (read_bytes < total) {
-        ssize_t chunk = recv(client_fd, &raw_request[read_bytes], total - read_bytes, 0);
-        if (chunk < 0) {
-            if (errno == EINTR) {
-                continue;
+    while (true) {
+        char buf[4096] = {0};
+        ssize_t n = recv(client_fd, buf, sizeof(buf), 0);
+        if (n > 0) {
+            std::lock_guard<std::mutex> lock(conn_mtx_);
+            // 每个连接保留自己的读缓冲区，用来承接半包和同一批次读到的多条请求。
+            std::string& pending = conn_read_buffers_[client_fd];
+            pending.append(buf, static_cast<size_t>(n));
+            if (pending.size() > kMaxBufferedRequestBytes) {
+                Logger::instance().error(
+                    "连接缓冲区超过上限，关闭连接, fd = " + std::to_string(client_fd)
+                );
+                conn_read_buffers_.erase(client_fd);
+                return kReadHttpRequestError;
             }
-            raw_request.clear();
-            return false;
+            continue;
         }
-        if (chunk == 0) {
-            raw_request.clear();
-            return false;
+
+        if (n == 0) {
+            peer_closed = true;
+            break;
         }
-        read_bytes += static_cast<size_t>(chunk);
+
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break;
+        }
+
+        Logger::instance().error(
+            "recv 失败, fd = " + std::to_string(client_fd) +
+            ", errno = " + std::to_string(errno) +
+            ", error = " + std::string(strerror(errno))
+        );
+        return kReadHttpRequestError;
     }
 
-    return true;
+    buffered_result = pop_buffered_http_request(client_fd, raw_request);
+    if (buffered_result == kReadHttpRequestReady) {
+        return buffered_result;
+    }
+    if (buffered_result == kReadHttpRequestError) {
+        Logger::instance().error("检测到非法 HTTP 请求, fd = " + std::to_string(client_fd));
+        return buffered_result;
+    }
+
+    if (peer_closed) {
+        std::lock_guard<std::mutex> lock(conn_mtx_);
+        std::unordered_map<int, std::string>::iterator it = conn_read_buffers_.find(client_fd);
+        if (it != conn_read_buffers_.end() && !it->second.empty()) {
+            Logger::instance().error("客户端关闭连接时仍有不完整请求, fd = " + std::to_string(client_fd));
+            return kReadHttpRequestError;
+        }
+        return kReadHttpRequestClosed;
+    }
+
+    return kReadHttpRequestIncomplete;
 }
 
 bool Server::send_buffer(int client_fd, const std::string& buffer, size_t& sent_bytes) const {
@@ -847,66 +1051,6 @@ bool Server::send_buffer(int client_fd, const std::string& buffer, size_t& sent_
         sent_bytes += static_cast<size_t>(n);
     }
 
-    return true;
-}
-
-bool Server::try_fast_handle_request(int client_fd, const std::string& raw_request) {
-    FastRequestMeta meta;
-    if (!parse_fast_static_request(raw_request, meta)) {
-        return false;
-    }
-
-    std::string file_path;
-    if (!resolve_static_path(meta.path, file_path)) {
-        return false;
-    }
-
-    std::shared_ptr<const StaticFileCacheEntry> static_file = get_static_file(file_path);
-    if (!static_file) {
-        return false;
-    }
-
-    const std::string& response =
-        meta.keep_alive ? static_file->keep_alive_response : static_file->close_response;
-    if (response.empty()) {
-        return false;
-    }
-
-    size_t sent = 0;
-    bool send_ok = send_buffer(client_fd, response, sent);
-    if (!send_ok) {
-        Logger::instance().error(
-            "快速路径 send 失败, fd = " + std::to_string(client_fd) +
-            ", errno = " + std::to_string(errno) +
-            ", error = " + std::string(strerror(errno))
-        );
-    } else {
-        Logger::instance().debug(
-            "快速路径响应成功, fd = " + std::to_string(client_fd) +
-            ", bytes = " + std::to_string(sent)
-        );
-    }
-
-    if (send_ok && meta.keep_alive && sent > 0) {
-        if (!set_nonblocking(client_fd)) {
-            Logger::instance().error("快速路径设置 client_fd 非阻塞失败, fd = " + std::to_string(client_fd));
-            close(client_fd);
-            erase_conn_activity(client_fd);
-            return true;
-        }
-
-        if (!add_conn_fd_to_epoll(client_fd)) {
-            close(client_fd);
-            erase_conn_activity(client_fd);
-            return true;
-        }
-
-        refresh_conn_timer(client_fd);
-        return true;
-    }
-
-    close(client_fd);
-    erase_conn_activity(client_fd);
     return true;
 }
 
@@ -962,13 +1106,17 @@ bool Server::send_response_parts(
     return true;
 }
 
-void Server::process_request_and_respond(int client_fd, const std::string& raw_request) {
+bool Server::process_request_and_respond(
+    int client_fd,
+    const std::string& raw_request,
+    bool& keep_alive
+) {
+    keep_alive = false;
+
     HttpRequest request;
     if (!request.parse(raw_request)) {
         Logger::instance().error("HTTP 请求解析失败, fd = " + std::to_string(client_fd));
-        close(client_fd);
-        erase_conn_activity(client_fd);
-        return;
+        return false;
     }
 
     std::string request_path = url_decode(strip_query_and_fragment(request.path()));
@@ -979,141 +1127,40 @@ void Server::process_request_and_respond(int client_fd, const std::string& raw_r
         ", version = " + request.version()
     );
 
-    std::string file_path;
-    std::string status_line;
-    std::string status_text;
-    std::string body;
-    const std::string* response_body = &body;
-    std::string content_type = "text/html; charset=UTF-8";
-    std::shared_ptr<const StaticFileCacheEntry> static_file;
-
-    if (request.method() == "GET") {
-        if (!resolve_static_path(request_path, file_path)) {
-            status_line = "HTTP/1.1 400 Bad Request\r\n";
-            status_text = "400 Bad Request";
-            body = build_html_message("400 Bad Request", "非法路径");
-        } else if ((static_file = get_static_file(file_path))) {
-            status_line = "HTTP/1.1 200 OK\r\n";
-            status_text = "200 OK";
-            content_type = static_file->content_type;
-            response_body = &static_file->body;
-        } else {
-            file_path = www_root_ + "/404.html";
-            status_line = "HTTP/1.1 404 Not Found\r\n";
-            status_text = "404 Not Found";
-            if ((static_file = get_static_file(file_path))) {
-                content_type = static_file->content_type;
-                response_body = &static_file->body;
-            } else {
-                status_line = "HTTP/1.1 500 Internal Server Error\r\n";
-                status_text = "500 Internal Server Error";
-                body = build_html_message("500 Internal Server Error", "服务器读取页面文件失败");
-            }
-        }
-    } else if (request.method() == "POST") {
-        if (request_path == "/post") {
-            status_line = "HTTP/1.1 200 OK\r\n";
-            status_text = "200 OK";
-            content_type = "text/plain; charset=UTF-8";
-            body = "POST OK\n";
-            body += request.body();
-        } else if (request_path == "/register") {
-            auto form = parse_form_urlencoded(request.body());
-            std::string username = form["username"];
-            std::string password = form["password"];
-
-            if (username.empty() || password.empty()) {
-                status_line = "HTTP/1.1 400 Bad Request\r\n";
-                status_text = "400 Bad Request";
-                body = build_html_message("注册失败", "username 或 password 不能为空");
-            } else {
-                std::string error_message;
-                if (register_user(username, password, error_message)) {
-                    status_line = "HTTP/1.1 200 OK\r\n";
-                    status_text = "200 OK";
-                    body = build_html_message("注册成功", "用户已写入 MySQL，可继续登录。");
-                } else if (error_message == "用户名已存在") {
-                    status_line = "HTTP/1.1 409 Conflict\r\n";
-                    status_text = "409 Conflict";
-                    body = build_html_message("注册失败", error_message);
-                } else {
-                    status_line = "HTTP/1.1 500 Internal Server Error\r\n";
-                    status_text = "500 Internal Server Error";
-                    body = build_html_message("注册失败", error_message);
-                }
-            }
-        } else if (request_path == "/login") {
-            auto form = parse_form_urlencoded(request.body());
-            std::string username = form["username"];
-            std::string password = form["password"];
-
-            if (username.empty() || password.empty()) {
-                status_line = "HTTP/1.1 400 Bad Request\r\n";
-                status_text = "400 Bad Request";
-                body = build_html_message("登录失败", "username 或 password 不能为空");
-            } else {
-                std::string error_message;
-                if (verify_user(username, password, error_message)) {
-                    status_line = "HTTP/1.1 200 OK\r\n";
-                    status_text = "200 OK";
-                    body = build_html_message("登录成功", "用户名和密码校验通过。");
-                } else if (error_message == "用户不存在" || error_message == "密码错误") {
-                    status_line = "HTTP/1.1 401 Unauthorized\r\n";
-                    status_text = "401 Unauthorized";
-                    body = build_html_message("登录失败", error_message);
-                } else {
-                    status_line = "HTTP/1.1 500 Internal Server Error\r\n";
-                    status_text = "500 Internal Server Error";
-                    body = build_html_message("登录失败", error_message);
-                }
-            }
-        } else {
-            file_path = www_root_ + "/404.html";
-            status_line = "HTTP/1.1 404 Not Found\r\n";
-            status_text = "404 Not Found";
-            if ((static_file = get_static_file(file_path))) {
-                content_type = static_file->content_type;
-                response_body = &static_file->body;
-            } else {
-                status_line = "HTTP/1.1 500 Internal Server Error\r\n";
-                status_text = "500 Internal Server Error";
-                body = build_html_message("500 Internal Server Error", "服务器读取页面文件失败");
-            }
-        }
-    } else {
-        status_line = "HTTP/1.1 405 Method Not Allowed\r\n";
-        status_text = "405 Method Not Allowed";
-        content_type = "text/plain; charset=UTF-8";
-        body = "Method Not Allowed";
+    std::unique_ptr<RequestHandler> handler = handler_factory_->create(request, request_path);
+    if (!handler) {
+        handler.reset(new MethodNotAllowedHandler());
     }
+    HandlerResponse response = handler->handle(*this, request, request_path);
+    const std::string& response_body = response.payload();
 
-    bool keep_alive = false;
+    bool request_keep_alive = false;
     std::string conn_header = to_lower_copy(request.header("Connection"));
     if (request.version() == "HTTP/1.1") {
-        keep_alive = (conn_header != "close");
+        request_keep_alive = (conn_header != "close");
     } else if (request.version() == "HTTP/1.0") {
-        keep_alive = (conn_header == "keep-alive");
+        request_keep_alive = (conn_header == "keep-alive");
     }
 
     std::string response_headers;
-    response_headers.reserve(128 + content_type.size());
-    response_headers += status_line;
-    response_headers += "Content-Type: " + content_type + "\r\n";
-    response_headers += "Content-Length: " + std::to_string(response_body->size()) + "\r\n";
-    response_headers += "Connection: " + std::string(keep_alive ? "keep-alive" : "close") + "\r\n";
+    response_headers.reserve(128 + response.content_type.size());
+    response_headers += response.status_line;
+    response_headers += "Content-Type: " + response.content_type + "\r\n";
+    response_headers += "Content-Length: " + std::to_string(response_body.size()) + "\r\n";
+    response_headers += "Connection: " + std::string(request_keep_alive ? "keep-alive" : "close") + "\r\n";
     response_headers += "\r\n";
 
     size_t sent = 0;
     bool can_use_prebuilt_response =
         request.method() == "GET" &&
-        status_text == "200 OK" &&
-        static_file &&
-        !(keep_alive ? static_file->keep_alive_response.empty() : static_file->close_response.empty());
+        response.status_text == "200 OK" &&
+        response.static_file &&
+        !(request_keep_alive ? response.static_file->keep_alive_response.empty() : response.static_file->close_response.empty());
     bool send_ok = false;
     if (can_use_prebuilt_response) {
-        const std::string& response =
-            keep_alive ? static_file->keep_alive_response : static_file->close_response;
-        send_ok = send_buffer(client_fd, response, sent);
+        const std::string& prebuilt_response =
+            request_keep_alive ? response.static_file->keep_alive_response : response.static_file->close_response;
+        send_ok = send_buffer(client_fd, prebuilt_response, sent);
         if (!send_ok) {
             Logger::instance().error(
                 "send 失败, fd = " + std::to_string(client_fd) +
@@ -1122,7 +1169,7 @@ void Server::process_request_and_respond(int client_fd, const std::string& raw_r
             );
         }
     } else {
-        send_ok = send_response_parts(client_fd, response_headers, *response_body, sent);
+        send_ok = send_response_parts(client_fd, response_headers, response_body, sent);
         if (!send_ok) {
             Logger::instance().error(
                 "send 失败, fd = " + std::to_string(client_fd) +
@@ -1135,57 +1182,88 @@ void Server::process_request_and_respond(int client_fd, const std::string& raw_r
     if (send_ok) {
         Logger::instance().debug(
             "响应发送成功, fd = " + std::to_string(client_fd) +
-            ", status = " + status_text +
+            ", status = " + response.status_text +
             ", bytes = " + std::to_string(sent)
         );
     }
 
-    if (send_ok && keep_alive && sent > 0) {
-        if (!set_nonblocking(client_fd)) {
-            Logger::instance().error("设置 client_fd 非阻塞失败, fd = " + std::to_string(client_fd));
-            close(client_fd);
-            erase_conn_activity(client_fd);
+    keep_alive = send_ok && request_keep_alive && sent > 0;
+    return send_ok;
+}
+
+void Server::process_ready_requests(int client_fd, const std::string& first_request, bool peer_closed) {
+    std::string raw_request = first_request;
+    bool should_close_after_buffer_drain = peer_closed;
+
+    while (true) {
+        // 同一个连接里如果已经缓冲了多条完整请求，就顺序拆包并连续处理。
+        bool keep_alive = false;
+        if (!process_request_and_respond(client_fd, raw_request, keep_alive)) {
+            close_client_connection(client_fd);
+            Logger::instance().debug("连接关闭, fd = " + std::to_string(client_fd));
             return;
         }
 
-        if (!add_conn_fd_to_epoll(client_fd)) {
-            close(client_fd);
-            erase_conn_activity(client_fd);
+        if (!keep_alive) {
+            close_client_connection(client_fd);
+            Logger::instance().debug("连接关闭, fd = " + std::to_string(client_fd));
+            return;
+        }
+
+        ReadHttpRequestResult next_result = pop_buffered_http_request(client_fd, raw_request);
+        if (next_result == kReadHttpRequestReady) {
+            Logger::instance().debug(
+                "连接缓冲区中还有完整请求，继续处理, fd = " + std::to_string(client_fd)
+            );
+            continue;
+        }
+        if (next_result == kReadHttpRequestError) {
+            Logger::instance().error("连接缓冲区中的后续请求非法, fd = " + std::to_string(client_fd));
+            close_client_connection(client_fd);
+            return;
+        }
+
+        if (should_close_after_buffer_drain) {
+            close_client_connection(client_fd);
+            Logger::instance().debug("对端已关闭输入，处理完缓冲区后关闭连接, fd = " + std::to_string(client_fd));
+            return;
+        }
+
+        if (!rearm_conn_fd_in_epoll(client_fd)) {
+            close_client_connection(client_fd);
             return;
         }
         refresh_conn_timer(client_fd);
         Logger::instance().debug("保持连接, fd = " + std::to_string(client_fd));
-    } else {
-        close(client_fd);
-        erase_conn_activity(client_fd);
-        Logger::instance().debug("连接关闭, fd = " + std::to_string(client_fd));
+        return;
     }
 }
 
 void Server::handle_client_impl(int client_fd) {
     std::string raw_request;
-    if (!try_read_fast_get_request(client_fd, raw_request)) {
-        // Reactor 模式：通用路径下仍保持原有的阻塞读取逻辑。
-        if (!set_blocking(client_fd)) {
-            Logger::instance().error("设置 client_fd 阻塞失败, fd = " + std::to_string(client_fd));
-            close(client_fd);
-            erase_conn_activity(client_fd);
-            return;
-        }
-
-        if (!read_http_request(client_fd, raw_request)) {
-            Logger::instance().error("读取请求失败或客户端已关闭连接, fd = " + std::to_string(client_fd));
-            close(client_fd);
-            erase_conn_activity(client_fd);
-            return;
-        }
+    bool peer_closed = false;
+    ReadHttpRequestResult read_result = read_http_request(client_fd, raw_request, peer_closed);
+    if (read_result == kReadHttpRequestError) {
+        Logger::instance().error("读取请求失败或客户端已关闭连接, fd = " + std::to_string(client_fd));
+        close_client_connection(client_fd);
+        return;
     }
-
-    if (try_fast_handle_request(client_fd, raw_request)) {
+    if (read_result == kReadHttpRequestClosed) {
+        Logger::instance().debug("客户端主动关闭连接, fd = " + std::to_string(client_fd));
+        close_client_connection(client_fd);
+        return;
+    }
+    if (read_result == kReadHttpRequestIncomplete) {
+        if (!rearm_conn_fd_in_epoll(client_fd)) {
+            close_client_connection(client_fd);
+            return;
+        }
+        refresh_conn_timer(client_fd);
+        Logger::instance().debug("请求未接收完整，等待后续数据, fd = " + std::to_string(client_fd));
         return;
     }
 
-    process_request_and_respond(client_fd, raw_request);
+    process_ready_requests(client_fd, raw_request, peer_closed);
 }
 
 void Server::handle_client(Server* server, int client_fd) {
@@ -1212,7 +1290,7 @@ void Server::check_timeout_connections() {
         int fd = expired_fds[i];
         Logger::instance().debug("连接超时，关闭 fd = " + std::to_string(fd));
         epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
-        close(fd);
+        close_client_connection(fd);
     }
 }
 
@@ -1274,7 +1352,7 @@ void Server::run() {
                         Logger::instance().error(
                             "设置 client_fd 非阻塞失败, fd = " + std::to_string(client_fd)
                         );
-                        close(client_fd);
+                        close_client_connection(client_fd);
                         continue;
                     }
 
@@ -1282,7 +1360,7 @@ void Server::run() {
                     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
                     if (!add_conn_fd_to_epoll(client_fd)) {
-                        close(client_fd);
+                        close_client_connection(client_fd);
                         continue;
                     }
                     refresh_conn_timer(client_fd);
@@ -1303,16 +1381,7 @@ void Server::run() {
                 Logger::instance().debug(
                     "客户端 fd 可读，准备交给线程池处理, client_fd = " + std::to_string(client_fd)
                 );
-                if (epoll_ctl(epfd_, EPOLL_CTL_DEL, client_fd, nullptr) == -1) {
-                    Logger::instance().error(
-                        "epoll_ctl DEL client_fd 失败, fd = " + std::to_string(client_fd) +
-                        ", error = " + std::string(strerror(errno))
-                    );
-                    close(client_fd);
-                    erase_conn_activity(client_fd);
-                    continue;
-                }
-                // 该连接已被线程接管处理，不再算“空闲连接”，先从堆定时器中移除。
+                // ONESHOT 模式下本轮事件处理完成前不会再次触发，这里只需要移除空闲计时。
                 erase_conn_activity(client_fd);
 
                 if (actor_model_ == 1) {
@@ -1326,28 +1395,30 @@ void Server::run() {
                 } else {
                     // 模拟 Proactor：主线程先完成读，再把“已读请求”交给线程池处理业务。
                     std::string raw_request;
-                    if (!try_read_fast_get_request(client_fd, raw_request)) {
-                        if (!set_blocking(client_fd)) {
-                            Logger::instance().error("设置 client_fd 阻塞失败, fd = " + std::to_string(client_fd));
-                            close(client_fd);
-                            erase_conn_activity(client_fd);
-                            continue;
-                        }
-
-                        if (!read_http_request(client_fd, raw_request)) {
-                            Logger::instance().error("主线程读取请求失败, fd = " + std::to_string(client_fd));
-                            close(client_fd);
-                            erase_conn_activity(client_fd);
-                            continue;
-                        }
+                    bool peer_closed = false;
+                    ReadHttpRequestResult read_result = read_http_request(client_fd, raw_request, peer_closed);
+                    if (read_result == kReadHttpRequestError) {
+                        Logger::instance().error("主线程读取请求失败, fd = " + std::to_string(client_fd));
+                        close_client_connection(client_fd);
+                        continue;
                     }
-
-                    if (try_fast_handle_request(client_fd, raw_request)) {
+                    if (read_result == kReadHttpRequestClosed) {
+                        Logger::instance().debug("客户端主动关闭连接, fd = " + std::to_string(client_fd));
+                        close_client_connection(client_fd);
+                        continue;
+                    }
+                    if (read_result == kReadHttpRequestIncomplete) {
+                        if (!rearm_conn_fd_in_epoll(client_fd)) {
+                            close_client_connection(client_fd);
+                            continue;
+                        }
+                        refresh_conn_timer(client_fd);
+                        Logger::instance().debug("主线程读到半包，等待后续数据, fd = " + std::to_string(client_fd));
                         continue;
                     }
 
-                    pool_.enqueue([this, client_fd, raw_request]() {
-                        process_request_and_respond(client_fd, raw_request);
+                    pool_.enqueue([this, client_fd, raw_request, peer_closed]() {
+                        process_ready_requests(client_fd, raw_request, peer_closed);
                     });
                     Logger::instance().debug(
                         "模拟Proactor任务已加入线程池, client_fd = " + std::to_string(client_fd)
@@ -1362,8 +1433,7 @@ void Server::run() {
                     "，关闭连接"
                 );
                 epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
-                close(fd);
-                erase_conn_activity(fd);
+                close_client_connection(fd);
             }
         }
     }

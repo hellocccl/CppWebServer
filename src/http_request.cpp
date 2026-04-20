@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 
 namespace {
 std::string trim(const std::string& s) {
@@ -22,7 +23,97 @@ std::string to_lower(std::string s) {
     });
     return s;
 }
+
+bool parse_size_value(const std::string& value, size_t& parsed) {
+    std::string trimmed = trim(value);
+    if (trimmed.empty()) {
+        return false;
+    }
+
+    size_t result = 0;
+    for (size_t i = 0; i < trimmed.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(trimmed[i]);
+        if (!std::isdigit(c)) {
+            return false;
+        }
+
+        size_t digit = static_cast<size_t>(trimmed[i] - '0');
+        if (result > (std::numeric_limits<size_t>::max() - digit) / 10) {
+            return false;
+        }
+        result = result * 10 + digit;
+    }
+
+    parsed = result;
+    return true;
+}
 } // namespace
+
+HttpRequest::ParseState HttpRequest::parse_request_size(const std::string& raw_buffer, size_t& request_size) {
+    request_size = 0;
+
+    size_t line_end = raw_buffer.find("\r\n");
+    if (line_end == std::string::npos) {
+        return kIncomplete;
+    }
+
+    size_t method_end = raw_buffer.find(' ');
+    if (method_end == std::string::npos || method_end >= line_end) {
+        return kInvalid;
+    }
+
+    size_t path_end = raw_buffer.find(' ', method_end + 1);
+    if (path_end == std::string::npos || path_end >= line_end) {
+        return kInvalid;
+    }
+
+    size_t header_end = raw_buffer.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        return kIncomplete;
+    }
+
+    size_t content_length = 0;
+    bool saw_content_length = false;
+    size_t cursor = line_end + 2;
+    while (cursor < header_end) {
+        size_t next = raw_buffer.find("\r\n", cursor);
+        if (next == std::string::npos || next > header_end) {
+            next = header_end;
+        }
+
+        if (next == cursor) {
+            cursor += 2;
+            continue;
+        }
+
+        size_t colon = raw_buffer.find(':', cursor);
+        if (colon != std::string::npos && colon < next) {
+            std::string key = to_lower(trim(raw_buffer.substr(cursor, colon - cursor)));
+            if (key == "content-length") {
+                size_t parsed_length = 0;
+                if (!parse_size_value(raw_buffer.substr(colon + 1, next - colon - 1), parsed_length)) {
+                    return kInvalid;
+                }
+
+                if (saw_content_length && content_length != parsed_length) {
+                    return kInvalid;
+                }
+
+                content_length = parsed_length;
+                saw_content_length = true;
+            }
+        }
+
+        cursor = next + 2;
+    }
+
+    request_size = header_end + 4 + content_length;
+    if (raw_buffer.size() < request_size) {
+        return kIncomplete;
+    }
+
+    return kComplete;
+}
 
 bool HttpRequest::parse(const std::string& raw_request) {
     method_.clear();
